@@ -22,6 +22,7 @@ from forus_parsing import (
     detect_currency_document,
     extraer_periodo,
     faltantes,
+    fechas_a_formato_local,
     find_date,
     find_label_value,
     find_money,
@@ -653,19 +654,19 @@ def build_excel(files):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(control).reindex(columns=CONTROL_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=CONTROL_COLUMNS).to_excel(
             writer, index=False, sheet_name="Control",
         )
-        pd.DataFrame(control).reindex(columns=CONTROL_AMPLIADO_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=CONTROL_AMPLIADO_COLUMNS).to_excel(
             writer, index=False, sheet_name="Control ampliado",
         )
-        pd.DataFrame(facturas).reindex(columns=FACTURA_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(facturas)).reindex(columns=FACTURA_COLUMNS).to_excel(
             writer, index=False, sheet_name="Facturas",
         )
         pd.DataFrame(resumen).reindex(columns=SUMMARY_COLUMNS).to_excel(
             writer, index=False, sheet_name="Resumen",
         )
-        pd.DataFrame(auditoria).reindex(columns=AUDIT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(auditoria)).reindex(columns=AUDIT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Auditoria",
         )
 

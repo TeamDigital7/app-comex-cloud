@@ -19,6 +19,7 @@ from forus_parsing import (
     collapse_spaces,
     cuadra,
     faltantes,
+    fechas_a_formato_local,
     find_date,
     find_dni,
     find_int,
@@ -537,16 +538,16 @@ def build_excel(files):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(boletas).reindex(columns=BOLETA_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(boletas)).reindex(columns=BOLETA_COLUMNS).to_excel(
             writer, index=False, sheet_name="Boletas",
         )
-        pd.DataFrame(conceptos).reindex(columns=CONCEPTO_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(conceptos)).reindex(columns=CONCEPTO_COLUMNS).to_excel(
             writer, index=False, sheet_name="Conceptos",
         )
         pd.DataFrame(resumen).reindex(columns=SUMMARY_COLUMNS).to_excel(
             writer, index=False, sheet_name="Resumen",
         )
-        pd.DataFrame(auditoria).reindex(columns=AUDIT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(auditoria)).reindex(columns=AUDIT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Auditoria",
         )
 
@@ -706,7 +707,7 @@ def render_boletas():
 
         if boletas:
             st.dataframe(
-                pd.DataFrame(boletas).reindex(columns=[
+                pd.DataFrame(fechas_a_formato_local(boletas)).reindex(columns=[
                     "Periodo", "Trabajador", "DNI", "Cargo", "Area",
                     "Total Ingresos", "Total Descuentos", "Neto a Pagar",
                     "Cuadra Neto", "Observaciones",
@@ -862,7 +863,7 @@ def render_alquileres():
 
         if control:
             st.dataframe(
-                pd.DataFrame(control).reindex(columns=COLUMNAS_VISTA_PREVIA).head(80),
+                pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=COLUMNAS_VISTA_PREVIA).head(80),
                 use_container_width=True,
                 hide_index=True,
             )

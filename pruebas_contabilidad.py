@@ -20,6 +20,7 @@ from forus_comprobante import (
     es_documento_exterior,
 )
 from forus_parsing import (
+    fechas_a_formato_local,
     find_date,
     find_money,
     parse_date,
@@ -264,6 +265,31 @@ class Fechas(unittest.TestCase):
         self.assertEqual(parse_date("01-Aug-2026"), "2026-08-01")
         self.assertEqual(parse_date("31 jul 2026"), "2026-07-31")
         self.assertEqual(parse_date("2026-08-03T23:51:02"), "2026-08-03")
+
+
+class FormatoDeFecha(unittest.TestCase):
+    """En pantalla y en el Excel las fechas van como se leen: dia/mes/año."""
+
+    def test_las_fechas_salen_como_dia_mes_anio(self):
+        filas = fechas_a_formato_local([
+            {"FECHA": "2026-07-21", "Fecha Vencimiento": "2026-08-30"},
+        ])
+        self.assertEqual(filas[0]["FECHA"], "21/07/2026")
+        self.assertEqual(filas[0]["Fecha Vencimiento"], "30/08/2026")
+
+    def test_no_toca_lo_que_no_es_una_fecha(self):
+        filas = fechas_a_formato_local([
+            {"DOCUMENTO": "F105-00206001", "IMPORTE": 129.85, "GLOSA": None,
+             "RUC": "20514020907"},
+        ])
+        self.assertEqual(filas[0]["DOCUMENTO"], "F105-00206001")
+        self.assertEqual(filas[0]["IMPORTE"], 129.85)
+        self.assertIsNone(filas[0]["GLOSA"])
+        self.assertEqual(filas[0]["RUC"], "20514020907")
+
+    def test_una_fecha_ya_convertida_se_queda_igual(self):
+        filas = fechas_a_formato_local([{"FECHA": "21/07/2026"}])
+        self.assertEqual(filas[0]["FECHA"], "21/07/2026")
 
 
 class TextoPunteado(unittest.TestCase):

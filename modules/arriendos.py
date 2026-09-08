@@ -18,12 +18,13 @@ import streamlit as st
 from forus_parsing import (
     buscar_mes_escrito,
     buscar_periodo_documento,
-    fecha_es,
     collapse_spaces,
     cuadra,
     detect_currency_document,
     extraer_periodo,
     faltantes,
+    fecha_es,
+    fechas_a_formato_local,
     find_date,
     find_label_value,
     find_money,
@@ -631,19 +632,19 @@ def build_excel(files):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(control).reindex(columns=CONTROL_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=CONTROL_COLUMNS).to_excel(
             writer, index=False, sheet_name="Control",
         )
-        pd.DataFrame(control).reindex(columns=CONTROL_AMPLIADO_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=CONTROL_AMPLIADO_COLUMNS).to_excel(
             writer, index=False, sheet_name="Control ampliado",
         )
-        pd.DataFrame(facturas).reindex(columns=FACTURA_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(facturas)).reindex(columns=FACTURA_COLUMNS).to_excel(
             writer, index=False, sheet_name="Facturas",
         )
         pd.DataFrame(resumen).reindex(columns=SUMMARY_COLUMNS).to_excel(
             writer, index=False, sheet_name="Resumen",
         )
-        pd.DataFrame(auditoria).reindex(columns=AUDIT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(auditoria)).reindex(columns=AUDIT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Auditoria",
         )
 
@@ -804,7 +805,7 @@ def render():
 
         if control:
             st.dataframe(
-                pd.DataFrame(control).reindex(columns=COLUMNAS_VISTA_PREVIA).head(80),
+                pd.DataFrame(fechas_a_formato_local(control)).reindex(columns=COLUMNAS_VISTA_PREVIA).head(80),
                 use_container_width=True,
                 hide_index=True,
             )

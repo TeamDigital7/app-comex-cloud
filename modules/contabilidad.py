@@ -37,10 +37,10 @@ from forus_comprobante import (
 from forus_parsing import (
     aplanar,
     collapse_spaces,
-    reparar_lineas_punteadas,
     cuadra,
     detect_currency_document,
     faltantes,
+    fechas_a_formato_local,
     find_date,
     find_label_value,
     find_money,
@@ -49,6 +49,7 @@ from forus_parsing import (
     fix_mojibake,
     normalize,
     parse_amount,
+    reparar_lineas_punteadas,
     split_lines,
 )
 from forus_ui import (
@@ -891,16 +892,16 @@ def build_excel_pagos(files):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(documentos).reindex(columns=PAGOS_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(documentos)).reindex(columns=PAGOS_COLUMNS).to_excel(
             writer, index=False, sheet_name="Pagos",
         )
-        pd.DataFrame(documentos).reindex(columns=PAGOS_AMPLIADO_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(documentos)).reindex(columns=PAGOS_AMPLIADO_COLUMNS).to_excel(
             writer, index=False, sheet_name="Pagos ampliado",
         )
         pd.DataFrame(resumen).reindex(columns=SUMMARY_COLUMNS).to_excel(
             writer, index=False, sheet_name="Resumen",
         )
-        pd.DataFrame(auditoria).reindex(columns=AUDIT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(auditoria)).reindex(columns=AUDIT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Auditoria",
         )
 
@@ -915,16 +916,16 @@ def build_excel_costos(files):
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        pd.DataFrame(documentos).reindex(columns=DOCUMENT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(documentos)).reindex(columns=DOCUMENT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Documentos",
         )
-        pd.DataFrame(items).reindex(columns=ITEM_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(items)).reindex(columns=ITEM_COLUMNS).to_excel(
             writer, index=False, sheet_name="Detalle",
         )
         pd.DataFrame(resumen).reindex(columns=SUMMARY_COLUMNS).to_excel(
             writer, index=False, sheet_name="Resumen",
         )
-        pd.DataFrame(auditoria).reindex(columns=AUDIT_COLUMNS).to_excel(
+        pd.DataFrame(fechas_a_formato_local(auditoria)).reindex(columns=AUDIT_COLUMNS).to_excel(
             writer, index=False, sheet_name="Auditoria",
         )
 
@@ -1199,7 +1200,7 @@ def render_pagos():
 
         if documentos:
             st.dataframe(
-                pd.DataFrame(documentos).reindex(columns=COLUMNAS_PAGOS_PREVIA).head(80),
+                pd.DataFrame(fechas_a_formato_local(documentos)).reindex(columns=COLUMNAS_PAGOS_PREVIA).head(80),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1295,7 +1296,7 @@ def render_costos():
 
         if documentos:
             st.dataframe(
-                pd.DataFrame(documentos).reindex(columns=COLUMNAS_COSTOS_PREVIA).head(80),
+                pd.DataFrame(fechas_a_formato_local(documentos)).reindex(columns=COLUMNAS_COSTOS_PREVIA).head(80),
                 use_container_width=True,
                 hide_index=True,
             )

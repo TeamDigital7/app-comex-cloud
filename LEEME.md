@@ -416,6 +416,14 @@ facturas habrían salido detraídas hasta en un reembolso de S/ 130.
 | La orden de compra adjunta ponía la factura en dólares | Los anexos ya no aportan importes ni moneda |
 | La fecha salía vacía con el rótulo en una línea y el dato en otra | Para fechas se mira también la línea siguiente, y el valor se valida |
 
+### Las fechas van día/mes/año
+
+En pantalla y en el Excel, toda fecha se escribe **DD/MM/AAAA** — `21/07/2026`,
+no `2026-07-21` — en las cuatro pantallas. Por dentro se siguen guardando en
+formato ISO, porque así ordenan y se comparan bien; la conversión se hace al
+armar cada hoja, de modo que ninguna columna se queda en el formato interno por
+olvido. Comex no cambia: ya tomaba la fecha del PDF tal cual, en `dd.mm.aaaa`.
+
 ### Pruebas
 
 `pruebas_contabilidad.py` deja fijado cada uno de estos errores con un trozo del

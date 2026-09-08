@@ -625,6 +625,30 @@ def find_razon_social_emisor(text, excluir=()):
     return None
 
 
+# Una fecha en formato interno: AAAA-MM-DD y nada mas. Se guardan asi porque
+# ordenan y se comparan bien, pero en pantalla y en el Excel se escriben como se
+# leen aqui, DD/MM/AAAA.
+FECHA_INTERNA_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def fechas_a_formato_local(filas):
+    """Las mismas filas, con toda fecha escrita como DD/MM/AAAA.
+
+    Se aplica al armar cada hoja, de modo que ninguna columna de fecha se queda
+    en el formato interno por olvido. Solo cambia el valor que es exactamente
+    una fecha: un numero de comprobante o una glosa no se tocan.
+    """
+    convertidas = []
+    for fila in filas:
+        convertidas.append({
+            clave: fecha_es(valor)
+            if isinstance(valor, str) and FECHA_INTERNA_RE.fullmatch(valor.strip())
+            else valor
+            for clave, valor in fila.items()
+        })
+    return convertidas
+
+
 NOMBRES_MES = [
     "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
     "JULIO", "AGOSTO", "SETIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE",
