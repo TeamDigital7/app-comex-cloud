@@ -12,6 +12,7 @@ import re
 from forus_ocr import estado_ocr, ultimo_error
 from forus_parsing import (
     REEMPLAZO,
+    aplanar,
     collapse_spaces,
     extraer_periodo,
     normalize,
@@ -26,16 +27,52 @@ from forus_parsing import (
 MARCADOR_DOCUMENTO_RE = re.compile(
     r"\b(?:FACTURA|BOLETA\s+DE\s+VENTA"
     rf"|NOTA\s+DE\s+D[E{REEMPLAZO}]BITO|NOTA\s+DE\s+CR[E{REEMPLAZO}]DITO)"
-    rf"\s+ELECTR[O{REEMPLAZO}]NICA",
+    # Entre el tipo y "ELECTRONICA" caben las palabras que cada pais intercala:
+    # "FACTURA ELECTRONICA DE VENTA", "FACTURA EXPORTACION ELECTRONICA".
+    rf"(?:\s+[A-Z]+){{0,2}}\s+ELECTR[O{REEMPLAZO}]NIC[AO]",
+    re.I,
+)
+
+# El recibo por honorarios (cuarta categoria) y el recibo de servicios publicos
+# son comprobantes de pago como la factura, y hasta ahora se descartaban: sus
+# archivos salian en la lista de "no se pudo leer" con el motivo equivocado.
+MARCADOR_RECIBO_RE = re.compile(
+    rf"RECIBO\s+POR\s+HONORARIOS|RECIBO\s+DE\s+SERVICIOS?\s+P[U{REEMPLAZO}]BLICOS?"
+    r"|\bRECIBO\s*(?:N[°ºO]?\.?)?\s*:",
     re.I,
 )
 
 TIPOS_DOCUMENTO = [
+    (r"RECIBO\s+POR\s+HONORARIOS", "Recibo por Honorarios"),
+    (rf"RECIBO\s+DE\s+SERVICIOS?\s+P[U{REEMPLAZO}]BLICOS?", "Recibo de Servicios"),
     (rf"NOTA\s+DE\s+CR[E{REEMPLAZO}]DITO", "Nota de Credito"),
     (rf"NOTA\s+DE\s+D[E{REEMPLAZO}]BITO", "Nota de Debito"),
     (r"BOLETA\s+DE\s+VENTA", "Boleta de Venta"),
     (r"FACTURA", "Factura"),
+    (r"\bRECIBO\b", "Recibo de Servicios"),
 ]
+
+# Un comprobante emitido fuera del Peru: no lleva RUC, ni serie y correlativo de
+# SUNAT, y el titulo va en el idioma de cada pais. Se reconocen para poder
+# pagarlos, dejando claro que no son comprobantes peruanos.
+MARCADOR_EXTERIOR_RE = re.compile(
+    r"\bTAX\s+INVOICE\b|\bINVOICE\s*(?:#|N[O°º]?\.?|NUMBER)\s*[:#]?\s*\w"
+    r"|\bN[UÚ]MERO\s+DE\s+FACTURA\b|\bFACTURA\s+DE\s+EXPORTACI[OÓ]N\b"
+    r"|\bFACTURA\s+EXPORTACI[OÓ]N\b|\bNIT\b|\bVAT\b|\bRUT\.?\s*:"
+    r"|\bE-?FACT\b|\bEXPORTACI[OÓ]N\b|\bNIF\b|\bCUIT\b|\bTAX\s+ID\b",
+    re.I,
+)
+
+# Paginas que acompañan al comprobante pero no lo son: la orden de compra, la
+# cotizacion, la constancia de SUNAT, el detalle consolidado. Sus importes y su
+# moneda no son los de la factura -la orden de compra imprime "$" hasta cuando
+# la factura es en soles- y contaminaban la lectura.
+MARCADOR_ANEXO_RE = re.compile(
+    r"ORDEN\s+DE\s+COMPRA\s+NRO|COTIZACI[OÓ]N|RESULTADO\s+DE\s+(?:LA\s+)?SOLICITUD"
+    r"|SUSPENSI[OÓ]N(?:ES)?\s+DE\s+4TA|REPORTE\s+CONSOLIDADO"
+    r"|CERTIFICADO\s+DE\s+RESIDENCIA|ESPACIO\s+RESERVADO\s+PARA\s+LA\s+DIAN",
+    re.I,
+)
 
 # "N| F004 - 00332954", "F102- 00162720", "F001 N| 00946359": el separador
 # cambia en cada proveedor, incluido el simbolo de numero mal decodificado. El
@@ -44,10 +81,27 @@ TIPOS_DOCUMENTO = [
 # bancaria no pase por numero de comprobante.
 # La serie termina siempre en dos digitos (F001, E001, F102, FF01). Exigirlo
 # evita que "AV. JAVIER PRADO ESTE 4200" se lea como la serie "ESTE-4200".
-NUMERO_FACTURA_RE = re.compile(
-    rf"\b([FBE][A-Z0-9]\d{{2}})\s*(?:N[°ºO{REEMPLAZO}]?\.?\s*)?[-–]?\s*(\d{{3,10}})\b",
+# Con guion es la forma normal: "F105- 00206001", "Nro: E001- 19",
+# "Recibo :SB01-0645497702". Ahi el correlativo puede ser de una sola cifra: los
+# recibos por honorarios recien empezados ("E001-19") se descartaban por exigir
+# tres, y el archivo entero salia como ilegible.
+# La serie es letra + caracter + dos digitos (F105, FE01, E001, SB01), lo que
+# evita que "AV. JAVIER PRADO ESTE 4200" pase por serie y correlativo.
+NUMERO_CON_GUION_RE = re.compile(
+    rf"\b([A-Z][A-Z0-9]\d{{2}})\s*(?:N[°ºO{REEMPLAZO}]?\.?\s*)?[-–—]\s*(\d{{1,10}})\b",
     re.I,
 )
+
+# Sin guion solo se acepta cuando el proveedor marca el numero ("F001 N| 00946359").
+NUMERO_CON_MARCA_RE = re.compile(
+    rf"\b([A-Z][A-Z0-9]\d{{2}})\s*N[°ºO{REEMPLAZO}]?\.?\s*(\d{{3,10}})\b",
+    re.I,
+)
+
+# Se conserva el nombre anterior porque otros modulos lo usan para descartar del
+# detalle las lineas que llevan un numero de comprobante.
+NUMERO_FACTURA_RE = NUMERO_CON_GUION_RE
+
 
 def detect_tipo_documento(texto):
     plano = normalize(texto)
@@ -58,14 +112,160 @@ def detect_tipo_documento(texto):
 
 
 def detect_numero_factura(texto):
-    match = NUMERO_FACTURA_RE.search(texto or "")
+    match = NUMERO_CON_GUION_RE.search(texto or "") or NUMERO_CON_MARCA_RE.search(texto or "")
     if not match:
         return None
     return f"{match.group(1).upper()}-{match.group(2)}"
 
 
 def es_pagina_de_documento(texto):
-    return bool(MARCADOR_DOCUMENTO_RE.search(normalize(texto or "")))
+    """Si la pagina lleva el titulo de un comprobante de pago peruano."""
+    plano = normalize(texto or "")
+    if MARCADOR_ANEXO_RE.search(plano):
+        return False
+    return bool(MARCADOR_DOCUMENTO_RE.search(plano) or MARCADOR_RECIBO_RE.search(plano))
+
+
+def es_pagina_anexo(texto):
+    """Si la pagina es un adjunto (orden de compra, cotizacion, constancia)."""
+    return bool(MARCADOR_ANEXO_RE.search(normalize(texto or "")))
+
+
+def es_documento_exterior(texto):
+    """Si el documento lo emitio un proveedor del exterior.
+
+    No lleva serie y correlativo de SUNAT, asi que se reconoce por el titulo y
+    por el identificador fiscal de su pais (NIT, VAT, RUT). Se exige ademas que
+    no haya un numero de comprobante peruano, para no confundir una factura
+    nacional que mencione de paso a un proveedor extranjero.
+    """
+    plano = normalize(texto or "")
+    if MARCADOR_ANEXO_RE.search(plano):
+        return False
+    if detect_numero_factura(texto):
+        return False
+    return bool(MARCADOR_EXTERIOR_RE.search(plano))
+
+
+# "Nro." tambien encabeza el numero de una direccion ("CAL. AMADOR MERINO REYNA
+# NRO. 267"). Las lineas de direccion se saltan para no tomar el numero de la
+# calle como numero de factura.
+LINEA_DIRECCION_RE = re.compile(
+    r"(?i)DIRECCI[OÓ]N|\bCAL\b|\bAV\b|\bJR\b|\bMZA\b|\bCALLE\b|\bCRA\b"
+    r"|\bINT\b|\bURB\b|\bDPTO\b|\bPISO\b|\bOFICINA\b|\bOF\b|\bLOTE\b",
+)
+
+# Como se numeran las facturas fuera del Peru: "Invoice #: 254084766",
+# "Numero de factura: 5649775837", "No. ADSM 5270", "Nro. TM 6778", "Nº 198".
+# Primero las marcas inequivocas ("Invoice #", "Numero de factura") y solo
+# despues el "Nro." suelto, que en un documento aparece muchas veces. Las
+# palabras que pueden ir entre "Factura" y su numero estan enumeradas a
+# proposito: dejar cualquier texto por medio hacia que "numeracion de
+# facturacion N°18764094446504" pasara por numero de la factura.
+RELLENO_TITULO = r"(?:[^\S\n]+(?:ELECTR[OÓ]NIC[AO]|DE|VENTA|EXPORTACI[OÓ]N))*"
+
+ETIQUETAS_NUMERO_EXTERIOR = (
+    rf"\b(?:INVOICE|FACTURA)\b{RELLENO_TITULO}\s{{0,3}}(?:#|N[O°º]\.?|NUMBER|N[U\u00da]MERO\b)",
+    r"N[U\u00da]MERO\s+DE\s+FACTURA",
+)
+
+# El "Nro." a secas se prueba al final, cuando ninguna marca clara dio nada.
+ETIQUETA_NUMERO_SUELTA = r"\bNRO\.?|\bNO\.|N[°º]"
+
+# Un candidato a numero: unas siglas opcionales y luego cifras.
+CANDIDATO_NUMERO_RE = re.compile(r"([A-Z]{0,6}[\s\-]?\d[\w\-]{1,19})", re.I)
+
+# Lo que nunca es el numero del comprobante aunque venga detras de un "No.":
+# el identificador fiscal del proveedor, el de una orden de compra o el codigo
+# de autorizacion del documento.
+CONTEXTO_AJENO_RE = re.compile(
+    r"(?i)(?:VAT|TAX|CNPJ|NIT|RUT|RUC|CUIT|NIF|CAE|ACCOUNT|CUENTA|IBAN|SWIFT"
+    r"|ORDEN|ORDER|COMPRA|IDENTIFICACI[OÓ]N|CUOTA|PEDIDO|TEL[EÉ]FONO|TELF)"
+    r"[\s\S]{0,12}$"
+)
+
+VENTANA_NUMERO = 150
+
+# La factura de exportacion uruguaya rotula sus columnas y pone los datos en la
+# linea siguiente: "Tipo Serie Numero" / "e-Fact. Exp. A 346".
+CABECERA_SERIE_NUMERO_RE = re.compile(r"TIPO\s+SERIE\s+N[U\u00da]MERO", re.I)
+SERIE_NUMERO_SUELTOS_RE = re.compile(r"\b([A-Z]{1,4})\s+(\d{1,10})\s*$")
+
+
+def _antes_en_la_linea(texto, posicion, maximo=40):
+    """Lo que precede a una posicion dentro de su propia linea.
+
+    Mirar mas atras de la linea daba falsos positivos: la direccion de la linea
+    anterior descartaba un numero que estaba perfectamente bien.
+    """
+    inicio_linea = texto.rfind("\n", 0, posicion) + 1
+    return texto[max(inicio_linea, posicion - maximo):posicion]
+
+
+def _candidato_valido(texto, inicio, candidato):
+    """Descarta lo que no puede ser el numero de un comprobante."""
+    previo = _antes_en_la_linea(texto, inicio)
+    if CONTEXTO_AJENO_RE.search(previo):
+        return False
+    if LINEA_DIRECCION_RE.search(previo):
+        return False
+
+    solo_digitos = re.sub(r"\D", "", candidato)
+    # Un RUC peruano de once digitos es el de la empresa, no un numero de
+    # factura del exterior.
+    if re.fullmatch(r"(?:10|15|16|17|20)\d{9}", solo_digitos):
+        return False
+    return True
+
+
+def _es_parte_de_fecha(texto, inicio, fin):
+    return texto[inicio - 1:inicio] == "/" or texto[fin:fin + 1] == "/"
+
+
+def _numero_tras_etiqueta(texto, etiqueta):
+    """Primer candidato aceptable detras de una de las marcas de numeracion."""
+    for marca in re.finditer(etiqueta, texto, re.I):
+        if LINEA_DIRECCION_RE.search(_antes_en_la_linea(texto, marca.start())):
+            continue
+
+        ventana = texto[marca.end():marca.end() + VENTANA_NUMERO]
+        for candidato in CANDIDATO_NUMERO_RE.finditer(ventana):
+            inicio = marca.end() + candidato.start()
+            fin = marca.end() + candidato.end()
+            if _es_parte_de_fecha(texto, inicio, fin):
+                continue
+            if not _candidato_valido(texto, inicio, candidato.group(1)):
+                continue
+            numero = collapse_spaces(candidato.group(1))
+            if numero:
+                return numero.upper().replace(" ", "-")
+    return None
+
+
+def _numero_bajo_encabezado(texto):
+    """La factura de exportacion que rotula las columnas y los datos debajo."""
+    lineas = split_lines(texto)
+    for indice, linea in enumerate(lineas[:-1]):
+        if not CABECERA_SERIE_NUMERO_RE.search(linea):
+            continue
+        suelto = SERIE_NUMERO_SUELTOS_RE.search(collapse_spaces(lineas[indice + 1]) or "")
+        if suelto:
+            return f"{suelto.group(1).upper()}-{suelto.group(2)}"
+    return None
+
+
+def detect_numero_exterior(texto):
+    """Numero del comprobante del exterior, tal como lo imprime el proveedor."""
+    texto = texto or ""
+
+    for etiqueta in ETIQUETAS_NUMERO_EXTERIOR:
+        numero = _numero_tras_etiqueta(texto, etiqueta)
+        if numero:
+            return numero
+
+    return _numero_bajo_encabezado(texto) or _numero_tras_etiqueta(
+        texto, ETIQUETA_NUMERO_SUELTA
+    )
 
 def agrupar_documentos(paginas):
     """Una factura por cada pagina con titulo de comprobante; el resto son anexos.
@@ -81,9 +281,16 @@ def agrupar_documentos(paginas):
     for pagina in paginas:
         texto = pagina["texto"]
         numero = detect_numero_factura(texto)
-        abre = es_pagina_de_documento(texto) and bool(numero) and (
-            not documentos or documentos[-1]["numero"] != numero
+        tiene_titulo = es_pagina_de_documento(texto) and not es_pagina_anexo(texto)
+
+        # La segunda hoja de una factura repite su titulo y su numero. Es una
+        # continuacion, no un anexo: tratarla como anexo dejaba fuera el pie de
+        # totales, que es justo lo que muchas facturas imprimen ahi.
+        continua = (
+            tiene_titulo and numero and documentos
+            and documentos[-1]["numero"] == numero
         )
+        abre = tiene_titulo and bool(numero) and not continua
 
         if abre:
             documentos.append({
@@ -92,26 +299,84 @@ def agrupar_documentos(paginas):
                 "paginas": [pagina],
                 "anexos": [],
             })
+        elif continua:
+            documentos[-1]["paginas"].append(pagina)
         elif documentos:
             documentos[-1]["anexos"].append(pagina)
 
     if not documentos:
-        # El rescate exige encontrar al menos la serie y correlativo. Sin eso no
-        # hay comprobante que leer, y armar una fila con lo que haya suelto es
-        # peor que no leer nada: los PDFs escaneados suelen traer adjunta una
-        # orden de compra, y sus importes no son los de la factura.
-        con_texto = [pagina for pagina in paginas if (pagina["texto"] or "").strip()]
-        numero = detect_numero_factura("\n".join(p["texto"] for p in con_texto))
-        if con_texto and numero:
-            documentos.append({
-                "numero": numero,
-                "pagina_inicial": con_texto[0]["numero"],
-                "paginas": con_texto,
-                "anexos": [],
-                "sin_titulo": True,
-            })
+        documentos = _rescatar(paginas)
 
     return documentos
+
+
+def _rescatar(paginas):
+    """Ultimo intento cuando ninguna pagina lleva titulo de comprobante.
+
+    Solo se miran las paginas que no son anexos: la orden de compra que se
+    adjunta trae sus propios importes y su propia moneda -imprime "$" aunque la
+    factura sea en soles- y tomarlos como si fueran los de la factura es peor
+    que no leer nada.
+    """
+    con_texto = [pagina for pagina in paginas if (pagina["texto"] or "").strip()]
+    propias = [pagina for pagina in con_texto if not es_pagina_anexo(pagina["texto"])]
+    if not propias:
+        return []
+
+    anexos = [pagina for pagina in con_texto if es_pagina_anexo(pagina["texto"])]
+    texto = "\n".join(pagina["texto"] for pagina in propias)
+
+    numero = detect_numero_factura(texto)
+    if numero:
+        return [{
+            "numero": numero,
+            "pagina_inicial": propias[0]["numero"],
+            "paginas": propias,
+            "anexos": anexos,
+            "sin_titulo": True,
+        }]
+
+    if es_documento_exterior(texto):
+        return [{
+            "numero": detect_numero_exterior(texto),
+            "pagina_inicial": propias[0]["numero"],
+            "paginas": propias,
+            "anexos": anexos,
+            "exterior": True,
+        }]
+
+    return []
+
+
+def aviso_paginas(paginas):
+    """Aviso sobre las paginas que no se pudieron leer, si es que las hay.
+
+    Solo se avisa de la pagina que se quedo sin texto porque el OCR no estaba o
+    fallo. Una hoja en blanco pasa por el OCR, no da texto y no es ningun
+    problema: avisar de ella solo hacia ruido en la hoja Auditoria.
+    """
+    sin_leer = [
+        pagina["numero"] for pagina in paginas
+        if not (pagina["texto"] or "").strip() and not pagina.get("ocr")
+        and not pagina.get("ocr_intentado")
+    ]
+
+    disponible, motivo = estado_ocr()
+    fallo = ultimo_error()
+
+    if not sin_leer and not (fallo and any(p.get("ocr_intentado") for p in paginas)):
+        return None
+
+    partes = []
+    if sin_leer:
+        partes.append("Paginas escaneadas (sin texto): "
+                      + ", ".join(str(numero) for numero in sin_leer))
+    if not disponible:
+        partes.append(f"El OCR no esta disponible: {motivo}")
+    elif fallo:
+        partes.append(fallo)
+
+    return ". ".join(partes) + "." if partes else None
 
 
 def diagnostico_lectura(paginas):
@@ -145,15 +410,25 @@ def diagnostico_lectura(paginas):
     else:
         detalle = ""
 
+    if es_documento_exterior(texto):
+        # No es un comprobante peruano: no tiene sentido reclamarle la serie y
+        # el correlativo de SUNAT.
+        return detalle or None
+
     faltan = []
     if not es_pagina_de_documento(texto):
         faltan.append('no se encontro el titulo del comprobante ("FACTURA ELECTRONICA" y similares)')
-    if not detect_numero_factura(texto):
+    if not detect_numero_factura(texto) and not detect_numero_exterior(texto):
         faltan.append("no se encontro la serie y correlativo (F001-00001234)")
 
     if not faltan:
         return detalle or None
-    return detalle + "Se leyo a medias: " + "; ".join(faltan)
+
+    # El texto se leyo bien; lo que fallo fue reconocer el comprobante dentro de
+    # el. Decirlo asi evita el diagnostico falso que se daba antes -"PDF
+    # escaneado, falta el OCR"- en archivos que traian todo su texto.
+    return (detalle + "El PDF si trae texto, pero no se reconocio el comprobante: "
+            + "; ".join(faltan))
 
 
 def deducir_totales_por_suma(texto):

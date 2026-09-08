@@ -20,10 +20,20 @@ import re
 
 import streamlit as st
 
-from forus_parsing import find_money, normalize, parse_amount
+from forus_parsing import aplanar, aplanar_con_reverso, find_money, normalize, parse_amount
 
 UMBRAL_DEFECTO = 700.0
 TASA_RETENCION_DEFECTO = 3.0
+
+# La detraccion no se aplica a operaciones de hasta S/ 700: es el minimo del
+# SPOT. Sin esto, las facturas de centro comercial -que llevan la leyenda del
+# SPOT impresa siempre, tambien en los reembolsos de S/ 130- salian detraidas.
+MINIMO_DETRACCION = 700.0
+
+# Renta de cuarta categoria: se retiene el 8% del recibo por honorarios cuando
+# pasa de S/ 1,500, salvo que el emisor tenga suspension de retenciones.
+TASA_RENTA_CUARTA = 8.0
+MINIMO_RENTA_CUARTA = 1500.0
 
 # Tope de plausibilidad para una retencion leida del comprobante. La del IGV es
 # del 3%; cualquier cosa muy por encima es que se leyo otro numero.
@@ -91,8 +101,16 @@ CODIGOS_VERIFICADOS = {"019", "021", "022"}
 # porque la descripcion enganya: un "MANTENIMIENTO" dentro de un arrendamiento
 # tributa como arrendamiento (019, 10%) y no como el codigo 020 (12%).
 PALABRAS_POR_CODIGO = [
-    ("019", ("ARRENDAMIENTO", "ARRIENDO", "ALQUILER", "RENTA MINIMA", "LOCAL COMERCIAL")),
-    ("027", ("TRANSPORTE DE BIENES", "FLETE", "TRANSPORTE DE CARGA")),
+    ("019", ("ARRENDAMIENTO", "ARRIENDO", "ALQUILER", "RENTA MINIMA", "LOCAL COMERCIAL",
+             # Como rotulan los centros comerciales lo que facturan por el
+             # local: todo forma parte del arrendamiento y detrae al 10%.
+             "CONTRAPRESTACION",
+             "RENTA VARIABLE", "RENTA FIJA", "GASTO COMUN", "GASTOS COMUNES",
+             "FONDO PROMOCION", "FONDO DE PROMOCION", "REEMBOLSO ARBITRIOS",
+             "MERCED CONDUCTIVA")),
+    ("027", ("TRANSPORTE DE BIENES", "FLETE", "TRANSPORTE DE CARGA",
+             "TRANSPORTE DE MERCADERIA", "TRANSPORTE DE MERCANCIA",
+             "SERVICIO DE TRANSPORTE DE", "TRANSPORTE TERRESTRE")),
     ("021", ("MOVIMIENTO DE CARGA", "ESTIBA", "DESESTIBA", "CARGA Y DESCARGA")),
     ("026", ("TRANSPORTE DE PERSONAL", "TRANSPORTE DE PERSONAS", "MOVILIDAD DEL PERSONAL")),
     ("012", ("INTERMEDIACION LABORAL", "TERCERIZACION", "DESTAQUE DE PERSONAL")),
@@ -104,15 +122,25 @@ PALABRAS_POR_CODIGO = [
 
 DETRACCION = "DETRACCION"
 RETENCION = "RETENCION"
+RETENCION_RENTA = "RETENCION 4TA"
 NO_AFECTO = "NO AFECTO"
 REVISAR = "REVISAR"
 
-SENALES_DETRACCION = (
-    "DETRACCION",
-    "SPOT",
-    "SISTEMA DE PAGO DE OBLIGACIONES TRIBUTARIAS",
-    "DECRETO LEGISLATIVO 940",
-    "D.L. 940",
+# Documentos que no generan detraccion ni retencion del IGV.
+RECIBO_HONORARIOS = "Recibo por Honorarios"
+DOCUMENTO_EXTERIOR = "Documento del Exterior"
+
+# Las leyendas del SPOT se buscan con hueco entre sus partes: las facturas las
+# imprimen a dos columnas y el extractor intercala el texto de la otra columna
+# ("SISTEMA DE PAGO DE / Autorizado mediante resolucion... / OBLIGACIONES
+# TRIBUTARIAS"). Buscando la frase entera y seguida no aparecia nunca, y las
+# facturas de centro comercial salian sin detraccion.
+HUECO = r"[\s\S]{0,160}?"
+
+SENALES_DETRACCION_RE = re.compile(
+    r"DETRACCION|\bSPOT\b"
+    rf"|SISTEMA\s+DE\s+PAGO\s+DE{HUECO}OBLIGACIONES\s+TRIBUTARIAS"
+    r"|DECRETO\s+LEGISLATIVO\s+940|D\.L\.\s*940",
 )
 
 # Si el proveedor ya es agente de retencion, percepcion o buen contribuyente,
@@ -138,6 +166,13 @@ PORCENTAJE_DETRACCION_SIN_SIMBOLO_RE = re.compile(
     re.I,
 )
 PORCENTAJE_SUELTO_RE = re.compile(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%")
+
+# La cuenta del Banco de la Nacion es la cuenta de detracciones: una linea que
+# la menciona habla de detraccion aunque no repita la palabra, y es justo donde
+# varios proveedores imprimen la tasa.
+CUENTA_DETRACCION_RE = re.compile(
+    r"BANCO\s+DE\s+LA\s+NACION|B/\s*NACION|\bBN\b|\b940\b"
+)
 # El codigo identifica el bien o servicio del Anexo que fija la tasa. Cada
 # proveedor lo rotula a su manera: "Codigo Detraccion: 019" o, en la
 # representacion impresa de SUNAT, "Bien o Servicio: 021 Movimiento de carga".
@@ -201,48 +236,52 @@ def buscar_codigo_por_concepto(glosa):
 
 
 # Leyendas que solo aparecen cuando la operacion esta de verdad sujeta al SPOT.
-LEYENDAS_SPOT = (
-    "SPOT",
-    "SISTEMA DE PAGO DE OBLIGACIONES TRIBUTARIAS",
-    "DECRETO LEGISLATIVO 940",
-    "D.L. 940",
-    "SUJETA A DETRACCION",
-    "SUJETO A DETRACCION",
-    "AFECTO A LA DETRACCION",
-    "PORCENTAJE DETRACCION",
-    "PORCENTAJE DE DETRACCION",
-    "CODIGO DETRACCION",
+LEYENDAS_SPOT_RE = re.compile(
+    r"\bSPOT\b"
+    rf"|SISTEMA\s+DE\s+PAGO\s+DE{HUECO}OBLIGACIONES\s+TRIBUTARIAS"
+    r"|DECRETO\s+LEGISLATIVO\s+940|D\.L\.\s*940"
+    r"|SUJET[AO]S?\s+A\s+(?:LA\s+)?DETRACCION|AFECT[AO]S?\s+A\s+(?:LA\s+)?DETRACCION"
+    r"|PORCENTAJE\s+(?:DE\s+)?DETRACCION|CODIGO\s+(?:DE\s+)?DETRACCION"
+    r"|CUENTA\s+DE\s+DETRACCION|DETRACCIONES\s*:",
 )
 
 
 def detectar_detraccion(texto):
-    """(sujeta, porcentaje, codigo) segun lo que declare el propio comprobante."""
-    plano = normalize(texto or "")
-    sujeta = any(senal in plano for senal in SENALES_DETRACCION)
-    if not sujeta:
+    """(sujeta, porcentaje, codigo) segun lo que declare el propio comprobante.
+
+    Se trabaja sobre el texto puesto en una sola linea: la leyenda del SPOT
+    viene partida donde acabe la caja del PDF ("OPERACIONES SUJETA AL SISTEMA DE
+    PAGO DE / OBLIGACIONES TRIBUTARIAS CON EL GOBIERNO CENTRAL") y buscada tal
+    cual no aparecia nunca. Por eso las facturas de centro comercial salian como
+    no sujetas a detraccion.
+    """
+    plano = aplanar(texto)
+    if not SENALES_DETRACCION_RE.search(plano):
         return False, None, None
 
     # Muchas facturas listan "Detraccion: S/ 0.00" en el pie de totales aunque
     # la operacion no este sujeta. Con importe cero y sin ninguna leyenda del
     # SPOT, esa palabra no significa que haya detraccion.
-    if not any(leyenda in plano for leyenda in LEYENDAS_SPOT):
+    if not LEYENDAS_SPOT_RE.search(plano):
+        # "Detraccion: S/ 0.00" en el pie de totales no significa nada.
         importe = find_money(texto, ["DETRACCION"])
         if importe is not None and importe == 0:
             return False, None, None
 
-    # Sobre el texto normalizado: si no, "Código" con tilde no casa nunca.
+    # Sobre el texto aplanado: si no, "Código" con tilde no casa nunca, y las
+    # etiquetas partidas en dos lineas tampoco.
     codigo = None
-    match_codigo = CODIGO_DETRACCION_RE.search(normalize(texto or ""))
+    match_codigo = CODIGO_DETRACCION_RE.search(plano)
     if match_codigo:
         codigo = match_codigo.group(1)
 
     porcentaje = None
-    match = PORCENTAJE_DETRACCION_RE.search(texto or "")
+    match = PORCENTAJE_DETRACCION_RE.search(plano)
     if match:
         porcentaje = parse_amount(match.group(1))
 
     if porcentaje is None:
-        match = PORCENTAJE_DETRACCION_SIN_SIMBOLO_RE.search(texto or "")
+        match = PORCENTAJE_DETRACCION_SIN_SIMBOLO_RE.search(plano)
         if match:
             porcentaje = parse_amount(match.group(1))
 
@@ -250,7 +289,9 @@ def detectar_detraccion(texto):
         # Algunos lo imprimen suelto, en la misma linea de la cuenta del Banco
         # de la Nacion. Solo se acepta si es una tasa de detraccion plausible.
         for linea in (texto or "").splitlines():
-            if not any(senal in normalize(linea) for senal in SENALES_DETRACCION):
+            plano_linea = normalize(linea)
+            if not (SENALES_DETRACCION_RE.search(plano_linea)
+                    or CUENTA_DETRACCION_RE.search(plano_linea)):
                 continue
             for candidato in PORCENTAJE_SUELTO_RE.findall(linea):
                 valor = parse_amount(candidato)
@@ -263,9 +304,22 @@ def detectar_detraccion(texto):
     return True, porcentaje, codigo
 
 
+# El recibo de servicios publicos y algunos comprobantes llevan impreso que no
+# entran en el regimen de retencion del IGV. Suele ir en vertical al margen, por
+# eso se mira tambien el texto al reves.
+NO_AFECTO_RETENCION_RE = re.compile(
+    r"NO\s+AFECTO\s+AL?\s+REGIMEN\s+DE\s+RETENCION"
+    r"|NO\s+SUJET[AO]S?\s+A(?:L)?\s+(?:REGIMEN\s+DE\s+)?RETENCION",
+)
+
+
 def proveedor_sin_retencion(texto):
     """El comprobante declara una condicion que excluye la retencion."""
-    plano = normalize(texto or "")
+    plano = aplanar_con_reverso(texto)
+
+    if NO_AFECTO_RETENCION_RE.search(plano):
+        return "Documento no afecto al regimen de retencion del IGV"
+
     for senal in SENALES_SIN_RETENCION:
         if senal in plano:
             return senal.capitalize()
@@ -283,8 +337,130 @@ def importe_en_soles(total, moneda, tipo_cambio):
     return None
 
 
+SUSPENSION_RENTA_RE = re.compile(
+    r"SUSPENSI[OÓ]N\s+DE\s+RETENCI|4TA\s+CATEGORIA\s*:?\s*AUTORIZADO"
+    r"|FORM(?:ULARIO)?\.?\s*1609",
+    re.I,
+)
+
+
+def tiene_suspension_renta(texto):
+    """El emisor adjunta la constancia de suspension de retenciones de 4ta."""
+    return bool(SUSPENSION_RENTA_RE.search(aplanar(texto)))
+
+
+def evaluar_recibo_honorarios(total, texto, monto_retencion_renta, en_soles,
+                              texto_anexos=None):
+    """Recibo por honorarios: renta de cuarta, nunca detraccion ni IGV.
+
+    Se respeta lo que el propio recibo imprime en "Retención (8 %) IR", que es
+    donde el emisor ya aplico -o no- su suspension de retenciones. Solo cuando
+    el recibo no lo dice se calcula: 8% si pasa de S/ 1,500.
+    """
+    base = {
+        "Codigo Detraccion": None,
+        "Concepto Detraccion": None,
+        "Importe en Soles": en_soles,
+    }
+
+    # La constancia de suspension suele venir adjunta al recibo, no dentro de
+    # el, asi que se busca tambien en los anexos del mismo PDF.
+    con_anexos = f"{texto or ''}\n{texto_anexos or ''}"
+    suspendido = tiene_suspension_renta(con_anexos)
+
+    if monto_retencion_renta is not None:
+        if monto_retencion_renta > 0:
+            porcentaje = round(monto_retencion_renta / total * 100, 2) if total else None
+            return {
+                **base,
+                "Afecto a": RETENCION_RENTA,
+                "Motivo": "Recibo por honorarios: retencion de renta de 4ta que trae impresa",
+                "Origen Tasa": "comprobante",
+                "% Aplicado": porcentaje,
+                "Monto Detraccion/Retencion": monto_retencion_renta,
+                "Neto a Pagar": round(total - monto_retencion_renta, 2),
+            }
+        if suspendido:
+            return {
+                **base,
+                "Afecto a": NO_AFECTO,
+                "Motivo": ("Recibo por honorarios sin retencion: lo consigna en cero y "
+                           "adjunta la constancia de suspension de retenciones"),
+                "Origen Tasa": "comprobante",
+                "% Aplicado": None,
+                "Monto Detraccion/Retencion": 0.0,
+                "Neto a Pagar": total,
+            }
+
+        # Por encima del minimo, un cero sin constancia de suspension no basta:
+        # si de verdad no corresponde retener hay que verlo, y si corresponde y
+        # no se retiene, la multa la paga quien paga el recibo.
+        if en_soles is not None and en_soles > MINIMO_RENTA_CUARTA:
+            return {
+                **base,
+                "Afecto a": REVISAR,
+                "Motivo": (f"El recibo consigna retencion cero pero supera los "
+                           f"S/ {MINIMO_RENTA_CUARTA:,.0f} y no se adjunta la constancia "
+                           f"de suspension: confirmar antes de pagar "
+                           f"(retencion del {TASA_RENTA_CUARTA:.0f}% = "
+                           f"S/ {total * TASA_RENTA_CUARTA / 100:,.2f})"),
+                "Origen Tasa": "comprobante",
+                "% Aplicado": None,
+                "Monto Detraccion/Retencion": None,
+                "Neto a Pagar": None,
+            }
+
+        return {
+            **base,
+            "Afecto a": NO_AFECTO,
+            "Motivo": (f"Recibo por honorarios de S/ {en_soles:,.2f}: lo consigna en cero "
+                       f"y no llega al minimo de S/ {MINIMO_RENTA_CUARTA:,.0f} para "
+                       f"retener renta de 4ta"),
+            "Origen Tasa": "comprobante",
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+        }
+
+    if suspendido:
+        return {
+            **base,
+            "Afecto a": NO_AFECTO,
+            "Motivo": "Recibo por honorarios con constancia de suspension de retenciones (4ta)",
+            "Origen Tasa": "comprobante",
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+        }
+
+    if en_soles is not None and en_soles <= MINIMO_RENTA_CUARTA:
+        return {
+            **base,
+            "Afecto a": NO_AFECTO,
+            "Motivo": (f"Recibo por honorarios de S/ {en_soles:,.2f}: no llega al minimo "
+                       f"de S/ {MINIMO_RENTA_CUARTA:,.0f} para retener renta de 4ta"),
+            "Origen Tasa": "regla",
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+        }
+
+    monto = round(total * TASA_RENTA_CUARTA / 100, 2)
+    return {
+        **base,
+        "Afecto a": RETENCION_RENTA,
+        "Motivo": (f"Recibo por honorarios de mas de S/ {MINIMO_RENTA_CUARTA:,.0f} sin "
+                   f"suspension: retencion de renta de 4ta del {TASA_RENTA_CUARTA:.0f}%"),
+        "Origen Tasa": "regla",
+        "% Aplicado": TASA_RENTA_CUARTA,
+        "Monto Detraccion/Retencion": monto,
+        "Neto a Pagar": round(total - monto, 2),
+    }
+
+
 def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros=None,
-            igv=None, tipo_documento=None, glosa=None, monto_retencion=None):
+            igv=None, tipo_documento=None, glosa=None, monto_retencion=None,
+            monto_retencion_renta=None, exterior=False, texto_anexos=None):
     """Decide si la factura va con detraccion, con retencion o con ninguna.
 
     Devuelve las columnas listas para el Excel, incluido el motivo, para que no
@@ -313,7 +489,34 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
         vacio["Motivo"] = "No se pudo leer el importe total"
         return vacio
 
-    # 0. Una nota de credito no genera detraccion ni retencion propias: lo que
+    # 0.a Un comprobante del exterior no esta en el sistema tributario peruano:
+    # ni detraccion ni retencion del IGV. Lo que si puede corresponder -renta de
+    # no domiciliados, IGV por utilizacion de servicios- se decide fuera de este
+    # control y por eso se dice en el motivo.
+    if exterior:
+        return {
+            "Afecto a": NO_AFECTO,
+            "Motivo": ("Comprobante del exterior (proveedor no domiciliado): no aplica "
+                       "detraccion ni retencion de IGV. Revisar aparte renta de no "
+                       "domiciliados e IGV por utilizacion de servicios"),
+            "Codigo Detraccion": None,
+            "Concepto Detraccion": None,
+            "Origen Tasa": None,
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+            "Importe en Soles": en_soles,
+        }
+
+    # 0.b El recibo por honorarios es renta de cuarta categoria: nunca lleva
+    # detraccion ni retencion del IGV. Antes se le aplicaba el 3% del IGV, que
+    # es un impuesto que este comprobante ni siquiera tiene.
+    if tipo_documento == RECIBO_HONORARIOS:
+        return evaluar_recibo_honorarios(
+            total, texto, monto_retencion_renta, en_soles, texto_anexos
+        )
+
+    # 0.c Una nota de credito no genera detraccion ni retencion propias: lo que
     # hace es restar del total a pagar al proveedor.
     if tipo_documento == "Nota de Credito":
         return {
@@ -326,7 +529,23 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
             "Importe en Soles": en_soles,
         }
 
-    # 1. La detraccion declarada en el comprobante manda sobre cualquier calculo.
+    # 1. La detraccion declarada en el comprobante manda sobre cualquier calculo,
+    # pero solo por encima del minimo del SPOT: las facturas de centro comercial
+    # llevan la leyenda impresa siempre, tambien en un reembolso de S/ 130.
+    if sujeta and en_soles is not None and en_soles <= MINIMO_DETRACCION:
+        return {
+            "Afecto a": NO_AFECTO,
+            "Motivo": (f"Operacion sujeta a detraccion pero de S/ {en_soles:,.2f}: no pasa "
+                       f"el minimo de S/ {MINIMO_DETRACCION:,.0f} del SPOT"),
+            "Codigo Detraccion": codigo,
+            "Concepto Detraccion": None,
+            "Origen Tasa": None,
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+            "Importe en Soles": en_soles,
+        }
+
     if sujeta:
         monto = monto_detraccion
         tasas = parametros.get("tasas") or get_tasas()
@@ -446,6 +665,23 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
         }
 
     # 5. Pasa el umbral: retencion, salvo que el proveedor este excluido.
+    # El recibo de servicios publicos esta fuera del regimen de retencion del
+    # IGV (Res. 037-2002/SUNAT). Los recibos de luz, agua y telefono lo llevan
+    # impreso al margen, en vertical, donde casi nunca se puede leer.
+    if tipo_documento == "Recibo de Servicios":
+        return {
+            "Afecto a": NO_AFECTO,
+            "Motivo": ("Recibo de servicios publicos: fuera del regimen de retencion "
+                       "del IGV (Res. 037-2002/SUNAT)"),
+            "Codigo Detraccion": None,
+            "Concepto Detraccion": None,
+            "Origen Tasa": None,
+            "% Aplicado": None,
+            "Monto Detraccion/Retencion": 0.0,
+            "Neto a Pagar": total,
+            "Importe en Soles": en_soles,
+        }
+
     excluido = proveedor_sin_retencion(texto)
     if excluido:
         return {

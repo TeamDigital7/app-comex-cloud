@@ -93,6 +93,63 @@ def normalize(text):
     return text.translate(TILDES).upper()
 
 
+def aplanar(text):
+    """Mayusculas, sin tildes y en una sola linea.
+
+    Las leyendas legales de las facturas vienen partidas donde acabe la caja de
+    texto ("OPERACIONES SUJETA AL SISTEMA DE PAGO DE\nOBLIGACIONES TRIBUTARIAS
+    CON EL GOBIERNO CENTRAL"). Buscarlas sobre el texto tal cual fallaba y la
+    factura salia como no sujeta a detraccion.
+    """
+    return re.sub(r"\s+", " ", normalize(text or ""))
+
+
+# Algunas facturas escriben sus campos con puntos guia entre cada letra
+# (".F.e..c.h..a. .d.e.. .la.. f.a..c.t.u.r.a....3..1.. j.u.l. .2.0..2.6"). Se
+# reconoce la racha -al menos dos caracteres seguidos, cada uno con sus puntos
+# detras- y se le quitan los puntos, sin espaciar: asi "3..1.." vuelve a ser
+# "31". Un importe como "31,089.51" no forma racha, de modo que sus decimales
+# nunca se tocan.
+RACHA_PUNTEADA_RE = re.compile(r"\.*(?:[^\s.]\.+){2,}[^\s.]?")
+
+# Para decidir si la linea lleva relleno punteado hace falta una racha larga.
+# Con una racha corta bastaria "S.A.C." para dar la linea por punteada, y la
+# razon social del proveedor perderia sus puntos.
+LINEA_PUNTEADA_RE = re.compile(r"\.*(?:[^\s.]\.+){4,}")
+
+# Restos de la racha: los puntos que quedan pegados a una letra. Solo se quitan
+# en las lineas donde ya se detecto el relleno punteado, para no tocar el resto
+# del documento. Un punto entre dos cifras nunca entra aqui.
+PUNTO_ENTRE_LETRAS_RE = re.compile(r"(?<=[^\W\d_])\.+|\.+(?=[^\W\d_])")
+
+
+def reparar_lineas_punteadas(text):
+    """Quita los puntos guia con los que algunas facturas rellenan sus campos."""
+    if not text:
+        return text or ""
+
+    lineas = []
+    for linea in text.split("\n"):
+        if LINEA_PUNTEADA_RE.search(linea):
+            linea = RACHA_PUNTEADA_RE.sub(lambda m: m.group(0).replace(".", ""), linea)
+            linea = PUNTO_ENTRE_LETRAS_RE.sub("", linea)
+        lineas.append(linea)
+    return "\n".join(lineas)
+
+
+def aplanar_con_reverso(text):
+    """El texto aplanado, y ademas leido al reves.
+
+    Algunos comprobantes imprimen sus leyendas legales en vertical, al margen de
+    la hoja; el extractor las devuelve letra por letra y en orden inverso
+    ("otcefa on otnemucoD"). Al darle la vuelta al texto vuelven a leerse, y asi
+    se aprovechan avisos que de otro modo se pierden -por ejemplo que el recibo
+    no esta afecto al regimen de retencion-.
+    """
+    plano = aplanar(text)
+    return plano + " " + aplanar((text or "")[::-1])
+
+
 def collapse_spaces(text):
     if text is None:
         return None
@@ -159,16 +216,41 @@ REEMPLAZO = "�"
 COMODIN_ACENTO = {letra: f"[{letra}{REEMPLAZO}]" for letra in "AEIOUN"}
 
 
+# Dentro de una etiqueta y entre la etiqueta y su valor solo se admiten
+# espacios de la misma linea. Con \s+ el salto de linea contaba como
+# separador y una etiqueta al final de la linea -el encabezado "... Descuento
+# Total" de la tabla de detalle- se llevaba el primer numero de la linea
+# siguiente, que es la cantidad del item. De ahi salian los importes de 1.00.
+ESPACIO_MISMA_LINEA = r"[^\S\n]"
+
+
 def _patron_etiqueta(label):
     partes = []
     for caracter in normalize(label):
         if caracter in COMODIN_ACENTO:
             partes.append(COMODIN_ACENTO[caracter])
         elif caracter == " ":
-            partes.append(r"\s+")
+            partes.append(ESPACIO_MISMA_LINEA + "+")
         else:
             partes.append(re.escape(caracter))
-    return "".join(partes)
+    cuerpo = "".join(partes)
+
+    # La etiqueta tiene que ser una palabra entera. Sin esto "TOTAL" acertaba
+    # dentro de "SUBTOTAL" y devolvia la base imponible en vez del importe
+    # total: es el error que bajaba las facturas sin IGV.
+    plano = normalize(label)
+    if plano[:1].isalnum():
+        cuerpo = r"(?<![A-Z0-9])" + cuerpo
+    if plano.startswith("TOTAL"):
+        # "SUB TOTAL" es la base imponible, no el importe total. Va aparte
+        # porque entre las dos palabras hay un espacio y la frontera de palabra
+        # no lo distingue.
+        cuerpo = r"(?<!SUB )" + cuerpo
+    if plano[-1:].isalpha():
+        cuerpo += r"(?![A-Z])"
+    elif plano[-1:].isdigit():
+        cuerpo += r"(?!\d)"
+    return cuerpo
 
 
 def find_label_value(text, labels, max_chars=90, requiere_separador=False):
@@ -190,7 +272,8 @@ def find_label_value(text, labels, max_chars=90, requiere_separador=False):
     return None
 
 
-def iter_label_values(text, labels, max_chars=90, requiere_separador=False):
+def iter_label_values(text, labels, max_chars=90, requiere_separador=False,
+                     siguiente_linea=False):
     """Todos los valores que siguen a las etiquetas, alias por alias.
 
     Hace falta porque una etiqueta suele aparecer varias veces: "TOTAL" esta
@@ -201,14 +284,23 @@ def iter_label_values(text, labels, max_chars=90, requiere_separador=False):
     if not text:
         return
 
-    separador = r"\s*[:=]\s*" if requiere_separador else r"\s*[:.\-]?\s*"
+    espacio = ESPACIO_MISMA_LINEA + "*"
+    if requiere_separador:
+        separador = espacio + r"[:=]" + espacio
+    else:
+        separador = espacio + r"[:.\-]?" + espacio
     plano = normalize(text)
 
     for label in labels:
         for match in re.finditer(_patron_etiqueta(label) + separador, plano):
             inicio = match.end()
             resto = text[inicio:inicio + max_chars]
-            valor = collapse_spaces(resto.split("\n", 1)[0])
+            partes = resto.split("\n")
+            valor = collapse_spaces(partes[0])
+            if siguiente_linea:
+                # Dos lineas: hay formularios que dejan una linea de por medio
+                # entre el rotulo de la columna y su dato.
+                valor = collapse_spaces(" ".join(partes[1:3]))
             if valor:
                 yield valor
 
@@ -216,17 +308,31 @@ def iter_label_values(text, labels, max_chars=90, requiere_separador=False):
 PORCENTAJE_RE = re.compile(r"\(?\s*\d+(?:[.,]\d+)?\s*%\s*\)?")
 
 
-def find_money(text, labels):
+MONEDA_SUELTA_RE = re.compile(r"(?i)(?:S/\.?|US\s*\$|U\$S|\$|\bUSD\b|\bPEN\b|\bEUR\b|\bCLP\b|\bCOP\b|\bSOLES\b|\bD[OÓ]LARES\b)")
+
+
+def find_money(text, labels, estricto=True):
     """Primer importe que aparece despues de alguna de las etiquetas.
 
     Descarta los porcentajes para que "IGV (18%): 180.00" devuelva 180.00 y
     no 18, que es el error tipico al leer estas cabeceras.
+
+    Con `estricto` -lo normal- el importe tiene que ser lo primero que sigue a
+    la etiqueta, admitiendo por medio solo el simbolo de moneda y los signos de
+    puntuacion. Es lo que impide que la etiqueta "TOTAL" se quede con el numero
+    de "Total Gravado 110.04", que es la base y no el importe total.
     """
     for crudo in iter_label_values(text, labels):
         limpio = PORCENTAJE_RE.sub(" ", crudo)
-        limpio = re.sub(r"(?i)(?:S/\.?|US\$|\$)", " ", limpio)
-        limpio = re.sub(r"(?i)\b(?:USD|PEN|EUR|SOLES|DOLARES)\b", " ", limpio)
-        match = re.search(r"-?\(?\d[\d.,]*\)?-?", limpio)
+        limpio = MONEDA_SUELTA_RE.sub(" ", limpio)
+        if estricto:
+            limpio = limpio.lstrip(" :=.-·|\t")
+            # Preposiciones que quedan entre la etiqueta y el numero al quitar
+            # la moneda: "Importe total adeudado en USD USD 31,089.51".
+            limpio = re.sub(r"(?i)^(?:[a-z]{1,3}\b[\s:.=-]*)+", "", limpio)
+            match = re.match(r"-?\(?\d[\d.,]*\)?-?", limpio)
+        else:
+            match = re.search(r"-?\(?\d[\d.,]*\)?-?", limpio)
         if match:
             valor = parse_amount(match.group(0))
             if valor is not None:
@@ -235,19 +341,35 @@ def find_money(text, labels):
 
 
 def find_percent(text, labels):
-    """Porcentaje asociado a una etiqueta, por ejemplo la tasa de detraccion."""
-    crudo = find_label_value(text, labels)
-    if not crudo:
-        return None
-    match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", crudo)
-    return parse_amount(match.group(1)) if match else None
+    """Porcentaje asociado a una etiqueta, por ejemplo la tasa de detraccion.
+
+    Recorre todas las apariciones: la primera suele ser un encabezado sin
+    numero detras, y quedarse con ella perdia la tasa.
+    """
+    for crudo in iter_label_values(text, labels):
+        match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", crudo)
+        if match:
+            valor = parse_amount(match.group(1))
+            if valor is not None:
+                return valor
+    return None
 
 
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4, "MAYO": 5, "JUNIO": 6,
     "JULIO": 7, "AGOSTO": 8, "SETIEMBRE": 9, "SEPTIEMBRE": 9, "OCTUBRE": 10,
     "NOVIEMBRE": 11, "DICIEMBRE": 12,
+    # Abreviados, en espanol y en ingles: los usan las facturas del exterior
+    # ("01-Aug-2026", "31 jul 2026").
+    "ENE": 1, "JAN": 1, "FEB": 2, "MAR": 3, "ABR": 4, "APR": 4, "MAY": 5,
+    "JUN": 6, "JUL": 7, "AGO": 8, "AUG": 8, "SET": 9, "SEP": 9, "OCT": 10,
+    "NOV": 11, "DIC": 12, "DEC": 12,
 }
+
+# "02 de Julio del 2026", "17 de julio de 2026".
+FECHA_EN_LETRAS_RE = re.compile(r"\b(\d{1,2})\s+DE\s+([A-Z]+)\s+DE\s*L?\s+(\d{4})\b")
+# "01-Aug-2026", "31 jul 2026", "05 SET 2026".
+FECHA_MES_ABREVIADO_RE = re.compile(r"\b(\d{1,2})[\s\-/]([A-Z]{3,10})\.?[\s\-/](\d{2,4})\b")
 
 
 def parse_date(value):
@@ -259,15 +381,19 @@ def parse_date(value):
     if not texto:
         return None
 
-    match = re.search(r"\b(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\b", texto)
+    # El cierre es (?!\d) y no \b para que la fecha de una marca de tiempo
+    # ("2026-08-03T23:51:02") tambien se reconozca: con \b la T pegada al dia
+    # impedia el match y la fecha de emision salia vacia.
+    match = re.search(r"\b(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})(?!\d)", texto)
     if match:
         anio, mes, dia = match.groups()
     else:
-        match = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b", texto)
+        match = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})(?!\d)", texto)
         if match:
             dia, mes, anio = match.groups()
         else:
-            match = re.search(r"\b(\d{1,2})\s+DE\s+([A-Z]+)\s+DE\s+(\d{4})\b", normalize(texto))
+            plano = normalize(texto)
+            match = FECHA_EN_LETRAS_RE.search(plano) or FECHA_MES_ABREVIADO_RE.search(plano)
             if not match:
                 return None
             dia, nombre_mes, anio = match.groups()
@@ -288,8 +414,43 @@ def parse_date(value):
     return f"{anio:04d}-{mes:02d}-{dia:02d}"
 
 
-def find_date(text, labels):
-    return parse_date(find_label_value(text, labels, max_chars=40))
+def find_date(text, labels, excluir=()):
+    """Fecha que sigue a alguna etiqueta, probando todas las apariciones.
+
+    `excluir` son palabras que delatan que la fecha encontrada es de otra cosa:
+    "Fecha Emisor: 25/02/21" es la del codigo de autorizacion del documento, no
+    la de la factura.
+
+    Muchas facturas rotulan la columna ("FECHA DE EMISION (DD/MM/AA)") en una
+    linea y ponen el dato mas abajo. Quedarse con la primera aparicion devolvia
+    "(DD/MM/AA)" y la fecha salia vacia.
+
+    Si en la misma linea no hay ninguna fecha se mira el principio de la linea
+    siguiente, que es donde caen los valores cuando la factura los imprime como
+    una tabla de dos filas: rotulos arriba, datos abajo. Con las fechas se puede
+    hacer porque el valor se valida -si no es una fecha, no se acepta-; con los
+    importes no, y por eso ahi se exige la misma linea.
+    """
+    def aceptable(crudo):
+        # Solo se mira lo que va justo delante de la fecha: en un texto largo
+        # -sobre todo si viene de un escaneo, donde los campos salen
+        # revueltos- una palabra excluida al otro extremo de la linea no dice
+        # nada sobre la fecha que se esta leyendo.
+        plano = normalize(crudo)
+        posicion = re.search(r"\d", plano)
+        antes = plano[max(0, posicion.start() - 25):posicion.start()] if posicion else plano
+        return not any(palabra in antes for palabra in excluir)
+
+    for crudo in iter_label_values(text, labels, max_chars=40):
+        fecha = parse_date(crudo) if aceptable(crudo) else None
+        if fecha:
+            return fecha
+
+    for crudo in iter_label_values(text, labels, max_chars=120, siguiente_linea=True):
+        fecha = parse_date(crudo) if aceptable(crudo) else None
+        if fecha:
+            return fecha
+    return None
 
 
 def find_ruc(text, labels=None):
@@ -316,6 +477,10 @@ def detect_currency(text):
         return "EUR"
     if "SOLES" in plano or "PEN" in plano or "S/" in (text or ""):
         return "PEN"
+    # Un "$" a secas en un documento sin ninguna marca peruana es un dolar:
+    # asi se firman las facturas de proveedores del exterior.
+    if "$" in (text or ""):
+        return "USD"
     return None
 
 
@@ -375,12 +540,22 @@ def detect_currency_document(text):
 # y en ese caso el nombre termina donde termina el sufijo.
 SUFIJO_SOCIETARIO_RE = re.compile(
     r"(?i)\b(?:S\.?\s*A\.?\s*C\.?|S\.?\s*A\.?\s*A\.?|S\.?\s*R\.?\s*L\.?"
-    r"|E\.?\s*I\.?\s*R\.?\s*L\.?|S\.?\s*A\.?|SAC|SRL|SAA|EIRL)(?:\s|$)"
+    r"|E\.?\s*I\.?\s*R\.?\s*L\.?|S\.?\s*A\.?\s*S\.?|S\.?\s*A\.?"
+    r"|SAC|SRL|SAA|EIRL|SAS|SPA|LTDA|LIMITED|LLC|LTD|INC|GMBH|B\.?V\.?)(?:\s|$)"
 )
 
 TITULOS_DOCUMENTO = (
     "FACTURA", "BOLETA", "NOTA DE", "RECIBO", "REPRESENTACION", "R.U.C", "RUC",
     "SENOR", "SE" + REEMPLAZO + "OR", "DIRECCION", "TELEFONO", "TELF", "AV.", "CAL.",
+    # Rotulos de las cajas del formulario. Sin esto la razon social salia como
+    # "FECHA DE EMISION (DD/MM/AA)" en las facturas que imprimen los titulos de
+    # los campos antes que la cabecera del emisor.
+    "FECHA", "MONEDA", "FORMA DE PAGO", "CONDICION", "CANTIDAD", "CODIGO",
+    "DESCRIPCION", "ITEM", "CLIENTE", "NOTAS", "ELABORADO", "OPERACION",
+    "DETRACCION", "DEPARTAMENTO", "NIT", "VAT", "RUT", "TAX", "INVOICE",
+    "BILL TO", "PAGINA", "PAGE", "SUBTOTAL", "TOTAL", "IGV", "SON ",
+    "BENEFICIARY", "BENEFICIARIO", "BANK", "BANCO", "IBAN", "SWIFT", "REMIT",
+    "ACCT", "ACCOUNT", "CUENTA", "PAYMENT",
 )
 
 
@@ -391,7 +566,10 @@ def find_razon_social_emisor(text, excluir=()):
     dos), se une. Las lineas de `excluir` -por ejemplo el nombre de la propia
     empresa- se saltan para no confundir al emisor con el cliente.
     """
-    lineas = split_lines(text)[:15]
+    # La cabecera no siempre esta arriba del todo: hay proveedores que imprimen
+    # antes los rotulos del formulario y hasta una marca de agua vertical. Por
+    # eso se recorre buena parte de la primera pagina y no solo su encabezado.
+    lineas = split_lines(text)[:LINEAS_CABECERA]
     excluir_plano = [normalize(termino) for termino in excluir]
 
     for indice, linea in enumerate(lineas):
@@ -536,6 +714,16 @@ NO_ES_NOMBRE = (
     "DIRECCION", "TELEFONO", "TELEFONOS", "TELF", "FAX", "PAGINA WEB",
     "CLIENTE", "AV.", "AV ", "CAL.", "CALLE", "JR.", "JIRON", "URB.",
     "NRO.", "CENTRAL TELEFONICA", "REPRESENTACION", "AUTORIZADO",
+    "FECHA", "MONEDA", "FORMA DE PAGO", "CONDICION", "CANTIDAD", "CODIGO",
+    "DESCRIPCION", "DETALLE", "ITEM", "NOTAS", "ELABORADO", "OPERACION",
+    "DETRACCION", "DEPARTAMENTO", "NIT", "VAT", "RUT", "TAX", "INVOICE",
+    "BILL TO", "PAGINA", "PAGE", "SUBTOTAL", "TOTAL", "IGV", "SON ",
+    "MZA.", "LOTE", "PERIODO", "VENCIMIENTO", "GIRO", "DATOS", "TIPO ",
+    "CONTACTO", "REFERENCIA", "CUENTA", "CICLO", "RESUMEN", "SEGUN",
+    "BENEFICIARY", "BENEFICIARIO", "BANK", "BANCO", "IBAN", "SWIFT", "REMIT",
+    "DOCUMENTO", "REMIT", "ATTN", "ADVERTISER", "ACCOUNT", "PAYMENT",
+    "BILLING", "LINE#", "IDENTIFICADO", "DOMICILIADO", "RECIBI", "POR CONCEPTO",
+    "OBSERVACION", "INCISO", "LA SUMA", "SON:",
 )
 
 # Coletillas del titulo que a veces quedan pegadas al nombre cuando el PDF
@@ -543,6 +731,10 @@ NO_ES_NOMBRE = (
 COLA_TITULO_RE = re.compile(
     r"\s*(?:ELECTR[OÓ]NICA|ELECTR[OÓ]NICO)\s*$", re.I
 )
+
+
+# Cuantas lineas de la primera pagina se miran buscando el nombre del emisor.
+LINEAS_CABECERA = 80
 
 
 def _nombre_plausible(linea):
@@ -560,6 +752,13 @@ def _nombre_plausible(linea):
         return None
     if len(re.findall(r"[A-Z]", plano)) < 6:
         return None
+    # Las leyendas que el PDF imprime en vertical salen del extractor como una
+    # sola palabra larga e ilegible ("aicnednetnirepuS"), y sin esta condicion
+    # una de ellas acababa de nombre del proveedor. Un nombre de una sola
+    # palabra se acepta si es corto o si lleva punto o guion, como las marcas
+    # ("Google", "Connectly.ai").
+    if " " not in limpia and len(limpia) > 12 and not re.search(r"[.\-]", limpia):
+        return None
     return limpia
 
 
@@ -575,7 +774,7 @@ def find_nombre_emisor(text, excluir=()):
         return societaria
 
     excluir_plano = [normalize(termino) for termino in excluir]
-    for linea in split_lines(text)[:12]:
+    for linea in split_lines(text)[:LINEAS_CABECERA]:
         if any(termino in normalize(linea) for termino in excluir_plano):
             continue
         nombre = _nombre_plausible(linea)

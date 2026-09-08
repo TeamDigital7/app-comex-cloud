@@ -24,7 +24,9 @@ import forus_ocr
 import forus_tributario as tributario
 from forus_comprobante import (
     agrupar_documentos,
+    aviso_paginas,
     deducir_totales_por_suma,
+    detect_numero_exterior,
     detect_numero_factura,
     diagnostico_lectura,
     extraer_lineas_detalle,
@@ -33,7 +35,9 @@ from forus_comprobante import (
 )
 
 from forus_parsing import (
+    aplanar,
     collapse_spaces,
+    reparar_lineas_punteadas,
     cuadra,
     detect_currency_document,
     faltantes,
@@ -163,6 +167,20 @@ CAMPOS_OBLIGATORIOS = [
     "Importe Total",
 ]
 
+# Un comprobante del exterior no tiene RUC: exigirselo solo generaba una
+# observacion falsa en todas las facturas de proveedores extranjeros.
+CAMPOS_OBLIGATORIOS_EXTERIOR = [
+    "Numero",
+    "Fecha Emision",
+    "Importe Total",
+]
+
+
+def campos_obligatorios(cabecera):
+    if cabecera.get("Tipo Documento") == "Documento del Exterior":
+        return CAMPOS_OBLIGATORIOS_EXTERIOR
+    return CAMPOS_OBLIGATORIOS
+
 ALIAS_COLUMNAS = [
     ("Codigo", ["CODIGO INTERNO", "COD. PRODUCTO", "CODIGO", "COD.", "COD", "ITEM"]),
     ("Descripcion", ["DESCRIPCION", "DETALLE", "CONCEPTO", "PRODUCTO", "BIEN O SERVICIO"]),
@@ -171,7 +189,7 @@ ALIAS_COLUMNAS = [
     ("Valor Unitario", ["VALOR UNITARIO", "VALOR UNIT.", "V. UNITARIO", "VALOR UNIT"]),
     ("Precio Unitario", ["PRECIO UNITARIO", "PRECIO UNIT.", "P. UNITARIO", "PRECIO UNIT", "PRECIO"]),
     ("Descuento", ["DESCUENTO", "DSCTO.", "DSCTO"]),
-    ("Importe", ["IMPORTE TOTAL", "VALOR DE VENTA", "VALOR VENTA", "IMPORTE", "SUBTOTAL", "TOTAL"]),
+    ("Importe", ["IMPORTE TOTAL", "VALOR DE VENTA", "VALOR VENTA", "IMPORTE", "SUBTOTAL", "TOTAL"]),  # noqa: E501
 ]
 
 UNIDADES = {
@@ -190,10 +208,45 @@ def get_ruc_empresa():
     return ruc if re.fullmatch(r"\d{11}", ruc) else None
 
 
+RUC_RE = re.compile(r"\b((?:10|15|16|17|20)\d{9})\b")
+
+# Rotulos que en un comprobante anuncian al cliente, no al emisor. El RUC que
+# viene detras de uno de ellos es el nuestro.
+ETIQUETAS_CLIENTE = (
+    "SENOR(ES)", "SENORES", "SENOR", "RECIBI DE", "IDENTIFICADO CON RUC",
+    "ADQUIRIENTE", "ADQUIRENTE", "CLIENTE", "BILL TO", "FACTURAR A",
+    "RAZON SOCIAL", "DOC. PE", "DATOS DEL CLIENTE", "RECEPTOR",
+)
+
+# Cuanto texto detras de la etiqueta se sigue considerando "cerca de ella".
+CERCANIA_CLIENTE = 300
+
+
+def ruc_del_cliente(text):
+    """RUC que aparece detras de una etiqueta de cliente.
+
+    Sin esto, en los comprobantes que imprimen primero los datos del cliente
+    -los recibos de servicios, por ejemplo- se tomaba nuestro propio RUC como
+    el del proveedor.
+    """
+    plano = aplanar(text)
+    sin_tildes = normalize(text or "")
+
+    for etiqueta in ETIQUETAS_CLIENTE:
+        if etiqueta not in plano:
+            continue
+        for match in re.finditer(re.escape(etiqueta), sin_tildes):
+            cerca = (text or "")[match.end():match.end() + CERCANIA_CLIENTE]
+            encontrado = RUC_RE.search(cerca)
+            if encontrado:
+                return encontrado.group(1)
+    return None
+
+
 def extraer_rucs(text):
     """Devuelve (ruc_emisor, ruc_cliente) mirando todos los RUC del documento."""
     encontrados = []
-    for match in re.finditer(r"\b((?:10|15|16|17|20)\d{9})\b", text or ""):
+    for match in RUC_RE.finditer(text or ""):
         ruc = match.group(1)
         if ruc not in encontrados:
             encontrados.append(ruc)
@@ -206,35 +259,107 @@ def extraer_rucs(text):
         emisor = next((ruc for ruc in encontrados if ruc != ruc_empresa), None)
         return emisor, ruc_empresa
 
+    cliente = ruc_del_cliente(text)
+    if cliente in encontrados:
+        emisor = next((ruc for ruc in encontrados if ruc != cliente), None)
+        return emisor, cliente
+
     emisor = encontrados[0]
     cliente = encontrados[1] if len(encontrados) > 1 else None
     return emisor, cliente
 
 
-def extraer_cabecera(text, pagina_inicial, paginas):
+# Etiquetas de la base imponible, del IGV y del importe total, en orden de
+# preferencia. El orden importa: la primera que aparezca en el comprobante es la
+# que manda, asi que las especificas van antes que las genericas.
+ETIQUETAS_GRAVADAS = [
+    "OP. GRAVADAS", "OP GRAVADAS", "OPERACIONES GRAVADAS", "OP. GRAVADA",
+    "OP GRAVADA", "TOTAL OPERACIONES GRAVADAS", "TOTAL GRAVADO", "TOTAL GRAVADA",
+    "TOTAL GRAVADAS", "SUB TOTAL VENTAS", "VALOR DE VENTA", "VALOR VENTA",
+    "MONTO EXPORTACION Y ASIMILADAS", "SUBTOTAL", "SUB TOTAL",
+]
+
+ETIQUETAS_IGV = [
+    "IGV (18%)", "I.G.V. (18%)", "IGV 18%", "I.G.V. 18%", "IGV(18%)",
+    "TOTAL IGV 18%", "TOTAL IGV", "TOTAL I.G.V.",
+    "IMPUESTO GENERAL A LAS VENTAS", "I.G.V.", "I.G.V", "IGV",
+]
+
+# "TOTAL" a secas va casi al final: en muchas facturas la palabra aparece antes
+# en el encabezado de la tabla de detalle y en "Total Gravado".
+ETIQUETAS_TOTAL = [
+    "IMPORTE TOTAL", "TOTAL A PAGAR", "TOTAL POR HONORARIOS",
+    "TOTAL CARGOS DEL MES", "INVOICE TOTAL", "IMPORTE TOTAL ADEUDADO",
+    "TOTAL AMOUNT", "MONTO TOTAL",
+    "PRECIO VENTA", "TOTAL VENTA", "TOTAL COMPROBANTE",
+    # "TOTAL GENERAL" va detras del "TOTAL" a secas: en las facturas de
+    # transporte es el total de los fletes, que es la base y no el importe.
+    "TOTAL", "TOTAL GENERAL", "TOTAL ADEUDADO", "AMOUNT DUE", "TOTAL DUE",
+    "BALANCE DUE",
+]
+
+# Diferencia que se tolera al comprobar que base + IGV = total.
+TOLERANCIA_TOTAL = 0.10
+
+# Fechas que llevan la palabra "fecha" al lado pero no son la de emision: la del
+# codigo de autorizacion del documento, la de vencimiento, la de entrega.
+PALABRAS_DE_OTRA_FECHA = (
+    "EMISOR", "VENCIMIENTO", "CAE", "AUTORIZACION", "SEGURIDAD", "ENTREGA",
+    "EXPIRATION",
+)
+
+
+def conciliar_total(total, gravadas, igv, otros):
+    """Corrige el importe total cuando lo leido es en realidad la base.
+
+    Es la red de seguridad del error que mas dolio: la etiqueta "Total" acertaba
+    dentro de "Subtotal" y la factura se pagaba por su valor sin IGV. Si lo leido
+    coincide con la base y existe un IGV que sumar, el total es la suma.
+
+    Devuelve (total, aviso).
+    """
+    if igv is None or igv <= 0 or gravadas is None:
+        return total, None
+
+    suma = round(gravadas + igv + otros, 2)
+
+    if total is None:
+        return suma, "El importe total se calculo como base + IGV: el comprobante no lo rotula"
+
+    if abs(total - suma) <= TOLERANCIA_TOTAL:
+        return total, None
+
+    if abs(total - gravadas) <= TOLERANCIA_TOTAL:
+        return suma, (f"El importe leido ({gravadas:,.2f}) era la base sin IGV; "
+                      f"se corrigio a {suma:,.2f} sumando el IGV")
+
+    return total, (f"El total del comprobante ({total:,.2f}) no cuadra con base mas "
+                   f"IGV ({suma:,.2f}): revisar")
+
+
+def extraer_cabecera(text, pagina_inicial, paginas, exterior=False):
     numero = detect_numero_factura(text)
+    if not numero and exterior:
+        numero = detect_numero_exterior(text)
     serie, _, correlativo = (numero or "").partition("-")
-    tipo = detect_tipo_documento(text)
+    tipo = "Documento del Exterior" if exterior else detect_tipo_documento(text)
 
     ruc_emisor, ruc_cliente = extraer_rucs(text)
+    if exterior:
+        # Un proveedor del exterior no tiene RUC. El unico RUC que aparece en su
+        # factura es el nuestro, y darlo por suyo confundia al proveedor con el
+        # cliente en el control de pagos.
+        ruc_cliente = ruc_cliente or ruc_emisor
+        ruc_emisor = None
 
     moneda = detect_currency_document(text)
 
-    gravadas = find_money(text, [
-        "OP. GRAVADAS", "OP GRAVADAS", "OPERACIONES GRAVADAS", "OP. GRAVADA",
-        "TOTAL OPERACIONES GRAVADAS", "SUB TOTAL VENTAS", "VALOR DE VENTA",
-        "SUBTOTAL", "SUB TOTAL",
-    ])
-    igv = find_money(text, [
-        "IGV (18%)", "I.G.V. (18%)", "IGV 18%", "I.G.V. 18%", "IGV(18%)",
-        "IMPUESTO GENERAL A LAS VENTAS", "I.G.V.", "IGV",
-    ])
-    total = find_money(text, [
-        "IMPORTE TOTAL", "TOTAL A PAGAR", "PRECIO VENTA", "TOTAL VENTA",
-        "TOTAL COMPROBANTE", "TOTAL",
-    ])
-    if total is None:
-        total = find_money(text, ["TOTAL"])
+    # En un comprobante del exterior no hay base imponible ni IGV peruanos: lo
+    # que ahi se llama "subtotal" o "tax" es de otro pais y llevarlo a esas
+    # columnas solo genera cifras que no significan nada.
+    gravadas = None if exterior else find_money(text, ETIQUETAS_GRAVADAS)
+    igv = None if exterior else find_money(text, ETIQUETAS_IGV)
+    total = find_money(text, ETIQUETAS_TOTAL)
 
     # Algunos proveedores imprimen los totales sin repetir las etiquetas.
     if gravadas is None or total is None:
@@ -259,10 +384,14 @@ def extraer_cabecera(text, pagina_inicial, paginas):
             "RAZON SOCIAL", "DENOMINACION",
         ]),
         "Fecha Emision": find_date(text, [
-            "FECHA DE EMISION", "FECHA EMISION", "F. EMISION", "FECHA",
-        ]),
+            "FECHA DE EMISION", "FECHA EMISION", "F. EMISION",
+            "FECHA Y HORA DE EMISION", "FECHA DE EXPEDICION", "EXPEDICION",
+            "FECHA DE LA FACTURA", "INVOICE DATE", "FECHA DE GENERACION",
+            "GENERACION", "FECHA",
+        ], excluir=PALABRAS_DE_OTRA_FECHA),
         "Fecha Vencimiento": find_date(text, [
             "FECHA DE VENCIMIENTO", "FECHA VENCIMIENTO", "F. VENCIMIENTO",
+            "VENCIMIENTO", "DUE DATE", "EXPIRATION DATE",
         ]),
         "Moneda": moneda,
         "Tipo de Cambio": find_money(text, ["TIPO DE CAMBIO", "T.C.", "TIPO CAMBIO"]),
@@ -287,10 +416,17 @@ def extraer_cabecera(text, pagina_inicial, paginas):
             "PORCENTAJE DE DETRACCION", "DETRACCION", "OPERACION SUJETA A DETRACCION",
         ]),
         "Retencion Monto": find_money(text, [
-            "TOTAL RETENCION", "MONTO DE RETENCION", "RETENCION IGV", "RETENCION",
+            "TOTAL RETENCION", "MONTO DE RETENCION", "RETENCION IGV", "RETENCION DEL IGV",
         ]),
+        # La del recibo por honorarios es renta de cuarta, no IGV: se guarda
+        # aparte para no mezclarlas.
+        "Retencion Renta Monto": find_money(text, [
+            "RETENCION (8 %) IR", "RETENCION (8%) IR", "RETENCION DE RENTA",
+            "RETENCION IR", "RETENCION",
+        ]) if tipo == "Recibo por Honorarios" else None,
         "Detraccion Monto": find_money(text, [
             "MONTO DE DETRACCION", "MONTO DETRACCION", "TOTAL DETRACCION",
+            "DETRACCION",
         ]),
         "Orden de Compra": find_label_value(text, [
             "ORDEN DE COMPRA", "ORDEN COMPRA", "O/C", "NRO. ORDEN", "NUMERO DE ORDEN",
@@ -303,12 +439,21 @@ def extraer_cabecera(text, pagina_inicial, paginas):
         ], max_chars=40),
     }
 
+    otros = sum(
+        fila.get(extra) or 0
+        for extra in ("Op. Exoneradas", "Op. Inafectas", "ISC", "Otros Cargos")
+    )
+
+    corregido, aviso = conciliar_total(total, gravadas, igv, otros)
+    if corregido != total:
+        fila["Importe Total"] = corregido
+        total = corregido
+    fila["Aviso Total"] = aviso
+
     esperado = None
     if gravadas is not None or igv is not None:
-        esperado = (gravadas or 0) + (igv or 0)
-        for extra in ("Op. Exoneradas", "Op. Inafectas", "ISC", "Otros Cargos"):
-            esperado += fila.get(extra) or 0
-    fila["Cuadra Total"] = cuadra(esperado, total, tolerancia=0.10)
+        esperado = (gravadas or 0) + (igv or 0) + otros
+    fila["Cuadra Total"] = cuadra(esperado, total, tolerancia=TOLERANCIA_TOTAL)
 
     return fila
 
@@ -451,7 +596,7 @@ def leer_paginas(uploaded_file):
         for numero, page in enumerate(pdf.pages, start=1):
             paginas.append({
                 "numero": numero,
-                "texto": fix_mojibake(page.extract_text() or ""),
+                "texto": reparar_lineas_punteadas(fix_mojibake(page.extract_text() or "")),
                 "tablas": page.extract_tables() or [],
             })
 
@@ -474,6 +619,19 @@ def construir_glosa(items, maximo=110):
     return glosa if len(glosa) <= maximo else glosa[:maximo - 3].rstrip() + "..."
 
 
+def glosa_declarada(texto):
+    """Concepto que el propio comprobante enuncia en una linea.
+
+    Los comprobantes sin tabla de detalle -el recibo por honorarios, sobre
+    todo- dicen para que se emiten en una sola frase. Sin esto la columna GLOSA
+    del control de pagos salia vacia justo en esos.
+    """
+    valor = find_label_value(texto, [
+        "POR CONCEPTO DE", "CONCEPTO DEL SERVICIO", "DESCRIPCION DEL SERVICIO",
+    ], max_chars=110)
+    return collapse_spaces(valor)
+
+
 def construir_fila_pago(cabecera):
     """Traduce el comprobante a las columnas del control de Contabilidad.
 
@@ -487,7 +645,11 @@ def construir_fila_pago(cabecera):
     if importe is not None and cabecera.get("Tipo Documento") == "Nota de Credito":
         importe = -abs(importe)
 
-    marca = {tributario.DETRACCION: "D", tributario.RETENCION: "R"}.get(afecto)
+    marca = {
+        tributario.DETRACCION: "D",
+        tributario.RETENCION: "R",
+        tributario.RETENCION_RENTA: "R",
+    }.get(afecto)
 
     a_pagar = None
     if importe is not None:
@@ -530,14 +692,20 @@ def process_pdf(uploaded_file, parametros=None):
         })
         return filas_documento, filas_item, filas_auditoria
 
-    aviso = diagnostico_lectura(paginas)
+    # Con el comprobante ya reconocido, lo unico que queda por avisar son las
+    # paginas que no se pudieron leer. El diagnostico completo -"no se
+    # reconocio el comprobante"- solo tiene sentido cuando no se reconocio
+    # ninguno, y repetirlo en documentos bien leidos alarmaba sin motivo.
+    aviso = aviso_paginas(paginas)
 
     for documento in documentos_agrupados:
         texto_completo = "\n".join(pagina["texto"] for pagina in documento["paginas"])
+        exterior = bool(documento.get("exterior"))
         cabecera = extraer_cabecera(
             texto_completo,
             documento["pagina_inicial"],
             len(documento["paginas"]),
+            exterior=exterior,
         )
         cabecera["PDF File"] = uploaded_file.name
 
@@ -577,7 +745,7 @@ def process_pdf(uploaded_file, parametros=None):
             })
 
         cabecera["Items"] = len(items)
-        cabecera["Glosa"] = construir_glosa(items)
+        cabecera["Glosa"] = construir_glosa(items) or glosa_declarada(texto_completo)
 
         # Detraccion o retencion: se decide aqui, con el texto completo del
         # comprobante delante, y viaja ya resuelto hasta el Excel de Pagos.
@@ -592,6 +760,9 @@ def process_pdf(uploaded_file, parametros=None):
             tipo_documento=cabecera.get("Tipo Documento"),
             glosa=cabecera.get("Glosa"),
             monto_retencion=cabecera.get("Retencion Monto"),
+            monto_retencion_renta=cabecera.get("Retencion Renta Monto"),
+            exterior=exterior,
+            texto_anexos="\n".join(anexo["texto"] for anexo in documento["anexos"]),
         ))
         cabecera.update(construir_fila_pago(cabecera))
 
@@ -600,7 +771,8 @@ def process_pdf(uploaded_file, parametros=None):
             cabecera["Origen Texto"] = "OCR"
         cabecera["Observaciones"] = "; ".join(
             parte for parte in [
-                faltantes(cabecera, CAMPOS_OBLIGATORIOS),
+                faltantes(cabecera, campos_obligatorios(cabecera)),
+                cabecera.get("Aviso Total"),
                 aviso,
                 "Leido por OCR de un escaneo: conviene revisar las cifras" if leido_por_ocr else None,
             ] if parte
@@ -672,11 +844,13 @@ def build_summary_pagos(documentos, archivos):
         {"Metric": "Archivos procesados", "Value": archivos},
         {"Metric": "Comprobantes", "Value": len(documentos)},
         {"Metric": "Con detraccion", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.DETRACCION)},
-        {"Metric": "Con retencion", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.RETENCION)},
+        {"Metric": "Con retencion de IGV", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.RETENCION)},
+        {"Metric": "Con retencion de renta (4ta)", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.RETENCION_RENTA)},
         {"Metric": "Sin detraccion ni retencion", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.NO_AFECTO)},
         {"Metric": "Por revisar a mano", "Value": sum(1 for d in documentos if d.get("Afecto a") == tributario.REVISAR)},
         {"Metric": "Monto total detraido", "Value": suma("Monto Detraccion/Retencion", tributario.DETRACCION)},
-        {"Metric": "Monto total retenido", "Value": suma("Monto Detraccion/Retencion", tributario.RETENCION)},
+        {"Metric": "Monto total retenido de IGV", "Value": suma("Monto Detraccion/Retencion", tributario.RETENCION)},
+        {"Metric": "Monto total retenido de renta", "Value": suma("Monto Detraccion/Retencion", tributario.RETENCION_RENTA)},
         {"Metric": "Neto a pagar", "Value": suma("Neto a Pagar")},
         {"Metric": "Comprobantes con campos sin leer", "Value": sum(1 for d in documentos if d.get("Observaciones"))},
         {"Metric": "Archivos sin ningun comprobante", "Value": archivos - len({d.get("PDF File") for d in documentos})},
@@ -767,8 +941,10 @@ def render_sidebar_pagos():
             f"""
             <div class="side-card">
                 UMBRAL S/ {parametros['umbral']:,.0f}<br>
-                RETENCION {parametros['tasa_retencion']:g}%<br>
-                DETRACCION SEGUN EL PDF
+                RETENCION IGV {parametros['tasa_retencion']:g}%<br>
+                DETRACCION SEGUN EL PDF<br>
+                MINIMO SPOT S/ {tributario.MINIMO_DETRACCION:,.0f}<br>
+                HONORARIOS {tributario.TASA_RENTA_CUARTA:g}% SOBRE S/ {tributario.MINIMO_RENTA_CUARTA:,.0f}
             </div>
             """,
             unsafe_allow_html=True,
@@ -991,7 +1167,10 @@ def render_pagos():
             excel_bytes, documentos = build_excel_pagos(uploaded_files)
 
         con_detraccion = sum(1 for d in documentos if d.get("Afecto a") == tributario.DETRACCION)
-        con_retencion = sum(1 for d in documentos if d.get("Afecto a") == tributario.RETENCION)
+        # La retencion de renta de cuarta se cuenta con las demas retenciones:
+        # para quien paga, las dos descuentan del importe del comprobante.
+        con_retencion = sum(1 for d in documentos if d.get("Afecto a") in
+                            (tributario.RETENCION, tributario.RETENCION_RENTA))
         sin_afectar = sum(1 for d in documentos if d.get("Afecto a") == tributario.NO_AFECTO)
         por_revisar = sum(1 for d in documentos if d.get("Afecto a") == tributario.REVISAR)
 

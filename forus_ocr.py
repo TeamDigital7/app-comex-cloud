@@ -55,7 +55,8 @@ def estado_ocr():
         _clase_motor()
     except ImportError as error:
         return False, (
-            f"Falta el motor de OCR ({error.name}). Anade rapidocr a requirements.txt"
+            f"Falta el motor de OCR: {error}. Anade rapidocr y onnxruntime a "
+            "requirements.txt"
         )
     except Exception as error:
         return False, (
@@ -79,9 +80,18 @@ def _clase_motor():
     """
     try:
         from rapidocr import RapidOCR
-    except ImportError:
-        from rapidocr_onnxruntime import RapidOCR
-    return RapidOCR
+        return RapidOCR
+    except ImportError as fallo_nuevo:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            return RapidOCR
+        except ImportError as fallo_viejo:
+            # Se cuentan los dos fallos. Antes solo se veia el segundo, y el
+            # aviso decia que faltaba una libreria que en realidad no hacia
+            # falta, escondiendo la causa verdadera.
+            raise ImportError(
+                f"rapidocr: {fallo_nuevo}; rapidocr_onnxruntime: {fallo_viejo}"
+            ) from fallo_nuevo
 
 
 @st.cache_resource(show_spinner=False)
@@ -96,21 +106,38 @@ def _motor():
     return _clase_motor()()
 
 
+def _lista(valor):
+    """Convierte a lista lo que devuelva el motor, venga como venga.
+
+    Segun la version, cada campo llega como lista, como tupla o como array de
+    numpy. Con un array no se puede preguntar "if valor" -numpy no sabe si un
+    array de varios elementos es verdadero o falso y lanza una excepcion-, y
+    ese detalle bastaba para tumbar la lectura de la pagina entera.
+    """
+    if valor is None:
+        return []
+    return list(valor)
+
+
 def _bloques(resultado):
     """Normaliza la salida a [(caja, texto, confianza)].
 
     La version 3.x devuelve un objeto con boxes, txts y scores por separado; la
-    antigua, una lista de tuplas.
+    antigua, una lista de tuplas. Cuando la pagina sale en blanco, la 3.x
+    devuelve el mismo objeto con los campos vacios: hay que reconocerlo por
+    tener el atributo, no por su contenido, porque el objeto no se puede
+    recorrer como una lista y el intento acababa en "not iterable".
     """
     if resultado is None:
         return []
 
-    cajas = getattr(resultado, "boxes", None)
-    if cajas is None:
+    if not hasattr(resultado, "boxes"):
         return list(resultado)
 
-    textos = getattr(resultado, "txts", None) or []
-    scores = getattr(resultado, "scores", None) or []
+    cajas = _lista(resultado.boxes)
+    textos = _lista(getattr(resultado, "txts", None))
+    scores = _lista(getattr(resultado, "scores", None))
+
     return [
         (cajas[indice], textos[indice] if indice < len(textos) else "",
          scores[indice] if indice < len(scores) else None)
@@ -217,6 +244,10 @@ def completar_paginas_vacias(datos_pdf, paginas):
 
     leidas = texto_por_ocr(datos_pdf, vacias)
     for pagina in paginas:
+        if pagina["numero"] in vacias:
+            # Queda anotado que la pagina paso por el OCR aunque no diera texto:
+            # una hoja en blanco no es un fallo y no hay que avisar de ella.
+            pagina["ocr_intentado"] = True
         if pagina["numero"] in leidas:
             pagina["texto"] = leidas[pagina["numero"]]
             pagina["ocr"] = True

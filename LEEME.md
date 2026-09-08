@@ -104,16 +104,40 @@ IGV, el motivo de la decisión y de qué archivo salió cada fila.
 
 La regla se aplica en este orden:
 
-0. **Una nota de crédito** no genera detracción ni retención propia: entra en
+0. **Un comprobante del exterior** (Meta, Google, un proveedor colombiano o
+   chileno) no está en el sistema tributario peruano: ni detracción ni
+   retención de IGV. El motivo recuerda que la renta de no domiciliados y el
+   IGV por utilización de servicios se ven aparte.
+1. **Un recibo por honorarios** es renta de cuarta categoría: nunca lleva
+   detracción ni retención del IGV. Ver más abajo.
+2. **Una nota de crédito** no genera detracción ni retención propia: entra en
    **negativo** para que reste del total a pagar al proveedor.
-1. **Si el comprobante declara detracción**, manda eso, con el porcentaje que
-   trae impreso. El proveedor ya determinó el tipo de servicio y su tasa.
-2. **Si no hay detracción y el total no pasa de S/ 700**, no corresponde
+3. **Si el comprobante declara detracción y pasa de S/ 700**, manda eso, con el
+   porcentaje que trae impreso. Por debajo de S/ 700 no hay detracción aunque
+   la leyenda del SPOT esté impresa: los centros comerciales la imprimen en
+   todas sus facturas, también en un reembolso de arbitrios de S/ 130.
+4. **Si no hay detracción y el total no pasa de S/ 700**, no corresponde
    retención.
-3. **Si la operación no tiene IGV** (inafecta o exonerada, como los intereses
+5. **Si la operación no tiene IGV** (inafecta o exonerada, como los intereses
    moratorios), tampoco: la retención es del IGV, y sin IGV no hay qué retener.
-4. **Si pasa de S/ 700**, corresponde retención del 3%, salvo que el proveedor
+6. **Un recibo de servicios públicos** (luz, agua, teléfono) está fuera del
+   régimen de retención del IGV por la Res. 037-2002/SUNAT.
+7. **Si pasa de S/ 700**, corresponde retención del 3%, salvo que el proveedor
    figure como agente de retención, agente de percepción o buen contribuyente.
+
+### Recibos por honorarios: renta de cuarta
+
+Se paga por lo que el propio recibo imprime en `Retención (8 %) IR`:
+
+| Lo que dice el recibo | Qué hace la app |
+|---|---|
+| Retención mayor que cero | La respeta y la descuenta del pago |
+| Cero, con la constancia de suspensión adjunta en el PDF | No retiene |
+| Cero, y el recibo no pasa de S/ 1,500 | No retiene: no llega al mínimo |
+| Cero, pasa de S/ 1,500 y no hay constancia | **REVISAR**, con el 8% calculado en el motivo |
+
+El último caso es a propósito: si corresponde retener y no se retiene, la multa
+la paga quien pagó el recibo.
 
 Detracción y retención nunca se aplican juntas. La detracción se redondea a
 soles enteros cuando la factura es en soles; en dólares conserva los decimales,
@@ -161,6 +185,25 @@ pero no imprime el porcentaje (le ocurre a Mall Plaza). Para el segundo caso,
 si quieres que se calcule igual, descomenta `tasa_detraccion_defecto = 10` en
 los secrets: se aplicará esa tasa y el motivo dirá que salió de la
 configuración, no del documento.
+
+### Qué comprobantes lee
+
+Además de la factura, la boleta y las notas de crédito y débito electrónicas,
+lee el **recibo por honorarios** (`E001-19`, aunque el correlativo tenga una
+sola cifra), el **recibo de servicios públicos** (`SB01-0645497702`) y la
+**factura de un proveedor del exterior**, que no tiene serie ni correlativo de
+SUNAT y numera a su manera (`Invoice #: 254084766`, `No. ADSM 5270`, `A 346`).
+
+La **orden de compra, la cotización y las constancias** que se adjuntan al PDF
+se anotan como anexos y no se leen: sus importes no son los de la factura, y su
+"$" no es la moneda del comprobante.
+
+### Comprobación aritmética
+
+Antes de dar por bueno el importe total se comprueba que **base + IGV = total**.
+Si lo leído coincide con la base y hay un IGV que sumar, el total se corrige y
+la observación de esa fila lo dice. Es la red de seguridad del error que hacía
+bajar facturas por su valor **sin IGV**.
 
 ### Contabilidad - Costos
 
@@ -306,3 +349,82 @@ En ILP el resultado se puede contrastar contra el propio PDF, que imprime
 
 Restaura `app_comex_cloud.py` desde el commit `2a25d7d`. Los archivos nuevos
 pueden quedarse: sin el entrypoint nuevo, nadie los importa.
+
+---
+
+## 8. Correcciones sobre facturas escaneadas, importes y detracciones
+
+Esta tanda salió de revisar **50 facturas reales** (centros comerciales,
+recibos por honorarios, recibos de Claro y facturas de proveedores del
+exterior). Antes se leían **26 de 50**; ahora se leen **las 50**.
+
+### El importe que bajaba sin IGV
+
+La búsqueda por etiqueta tenía dos fallos que se sumaban:
+
+- **`TOTAL` acertaba dentro de `SUBTOTAL`.** En una factura que imprime
+  `Subtotal S/3,022.72` antes que `Total S/3,566.81`, se bajaba la base. Es el
+  error de las 78 facturas que hubo que corregir a mano. Ahora la etiqueta
+  tiene que ser una palabra entera, y `SUB TOTAL` tampoco cuenta.
+- **El separador entre etiqueta y valor admitía el salto de línea.** El
+  encabezado de la tabla (`... Descuento Total`) se llevaba el primer número de
+  la línea siguiente, que es la cantidad del ítem: de ahí los importes de 1,00.
+  Ahora el importe tiene que estar en la misma línea que su etiqueta.
+
+Encima va la comprobación **base + IGV = total**, que corrige el importe si aun
+así se coló la base y lo deja anotado en la observación de la fila.
+
+### Los archivos que decían "PDF escaneado, falta el OCR"
+
+**Sí traían texto.** Lo que fallaba era el reconocimiento del comprobante: un
+recibo por honorarios `E001-19` se descartaba por tener el correlativo de dos
+cifras, y un recibo de Claro `SB01-...` porque la serie no empezaba por F, B
+o E. El diagnóstico echaba la culpa al OCR y mandaba a instalar una librería
+que no faltaba. Ahora el aviso distingue las dos cosas.
+
+Del OCR de verdad se arreglaron dos cosas:
+
+- **`'RapidOCROutput' object is not iterable`**: una página en blanco tumbaba la
+  lectura de esa página en vez de devolver vacío.
+- **El aviso de librería que falta mentía**: al probar las dos versiones del
+  motor solo se contaba el fallo de la segunda, escondiendo la causa real.
+
+### Las detracciones que salían en cero
+
+La leyenda del SPOT viene partida donde acaba la caja de texto del PDF, y en las
+facturas a dos columnas se le mete texto de la otra columna por medio:
+
+```
+OPERACIONES SUJETA AL SISTEMA DE PAGO DE
+Autorizado mediante resolución: N°300-2014-SUNAT
+OBLIGACIONES TRIBUTARIAS CON EL GOBIERNO CENTRAL
+```
+
+Buscada como una frase seguida no aparecía nunca, y toda factura de centro
+comercial salía como no sujeta a detracción. Ahora se busca tolerando el hueco.
+Junto con eso entró el **mínimo de S/ 700 del SPOT**, sin el cual esas mismas
+facturas habrían salido detraídas hasta en un reembolso de S/ 130.
+
+### Otros arreglos de la misma revisión
+
+| Qué pasaba | Qué se hizo |
+|---|---|
+| Un recibo por honorarios llevaba retención de IGV del 3% | Va por renta de cuarta: 8%, mínimo S/ 1.500 y constancia de suspensión |
+| El proveedor salía como "FECHA DE EMISIÓN (DD/MM/AA)" | La razón social se busca en toda la cabecera y se descartan los rótulos |
+| El RUC del cliente pasaba por el del proveedor | El RUC que sigue a "Recibí de", "Señor(es)" o "Bill to" es el del cliente |
+| La segunda hoja de la factura contaba como anexo | Si repite título y número es continuación: sus totales se leen |
+| La orden de compra adjunta ponía la factura en dólares | Los anexos ya no aportan importes ni moneda |
+| La fecha salía vacía con el rótulo en una línea y el dato en otra | Para fechas se mira también la línea siguiente, y el valor se valida |
+
+### Pruebas
+
+`pruebas_contabilidad.py` deja fijado cada uno de estos errores con un trozo del
+comprobante que lo provocaba. Se ejecuta sin PDFs ni red:
+
+```
+python -m unittest pruebas_contabilidad -v
+```
+
+Sobre las 50 facturas de la revisión: 50 comprobantes leídos de 50 archivos,
+0 archivos sin leer, y las 4 observaciones que quedan son las de los PDFs
+realmente escaneados, avisando de que conviene repasar sus cifras.
