@@ -205,6 +205,43 @@ def texto_por_ocr(datos_pdf, numeros_pagina):
     return resultados
 
 
+def texto_de_cabecera_por_ocr(datos_pdf, numero_pagina=1, alto=0.25):
+    """Texto de la franja de arriba de una pagina, leido por OCR.
+
+    Sirve para lo que el PDF no trae como texto aunque la pagina si lo tenga:
+    la razon social de bastantes emisores esta dentro del logo, que es una
+    imagen. Se rasteriza solo la cabecera -no la pagina entera- porque es donde
+    va el nombre y asi el OCR tarda una fraccion.
+    """
+    if not ocr_disponible():
+        return ""
+
+    import numpy as np
+    import pypdfium2 as pdfium
+
+    try:
+        motor = _motor()
+    except Exception as error:
+        _ULTIMO_ERROR["motivo"] = f"El motor de OCR no se pudo cargar: {error}"
+        return ""
+
+    documento = pdfium.PdfDocument(io.BytesIO(datos_pdf))
+    try:
+        indice = numero_pagina - 1
+        if indice < 0 or indice >= len(documento):
+            return ""
+        imagen = documento[indice].render(scale=RESOLUCION / 72).to_pil()
+        franja = imagen.crop((0, 0, imagen.width, max(1, int(imagen.height * alto))))
+        bloques = _bloques(motor(np.array(franja)))
+    except Exception as error:
+        _ULTIMO_ERROR["motivo"] = f"El OCR fallo en la cabecera: {error}"
+        return ""
+    finally:
+        documento.close()
+
+    return _agrupar_en_lineas(bloques)
+
+
 def completar_paginas_vacias(datos_pdf, paginas):
     """Rellena por OCR las paginas que no traian texto.
 

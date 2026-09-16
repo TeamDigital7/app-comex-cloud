@@ -182,15 +182,50 @@ tus nueve columnas, en tu orden**, una fila por concepto:
 Más las hojas **Control ampliado** (con contrato, local, periodo, importe con
 IGV, observaciones), **Facturas**, **Resumen** y **Auditoría**.
 
-- **Tienda** — el local cuando la factura lo trae (`S146 HUSH PUPPIES`) y, si
-  no, el número de contrato (`9244`) o la referencia (`LCS 1070`).
-- **MES** — el del periodo facturado, sacado del propio concepto.
+- **Tienda** — el local **de esa línea**. Una factura de Cencosud cobra tres
+  locales distintos en tres líneas (`S2012`, `S2016`, `S3024`) y cada fila sale
+  con el suyo. Si la línea no trae local, se usa el de la cabecera
+  (`S146 HUSH PUPPIES`) y, si tampoco, el número de contrato o la referencia.
+- **MES** — el del periodo de la propia línea, no el del documento: una misma
+  factura puede traer conceptos de julio y de setiembre.
 - **SOLES / DOLARES** — el importe **sin IGV**. La columna correcta se elige
   probando cuál cuadra con la base imponible, porque cada emisor la pone en un
-  sitio distinto.
+  sitio distinto. Si el emisor solo imprime el precio con IGV —Cencosud es el
+  caso—, se detecta porque la columna suma el importe total y se baja a valor
+  de venta; la suma de las filas queda clavada en la base imponible.
+- **RAZON SOCIAL** — sale del RUC, no de lo que se lea en la cabecera. Muchos
+  emisores imprimen su razón social dentro del logo, que es una imagen: el PDF
+  no trae ese texto y lo único legible es el nombre comercial del centro
+  comercial (`CENTRO COMERCIAL PLAZA SAN MIGUEL`, que en realidad es
+  `MALL SERVICE S.A.C.`).
 - **FECHA DE ENTREGA** — va vacía: no está en el PDF, es dato de ustedes.
 
 **Ya no hay lectura de boletas de pago.**
+
+#### Lo que se corrigió en esta revisión
+
+Las seis fallas que salieron al leer el lote de facturas de retail:
+
+| Fallaba | Ahora |
+|---|---|
+| La RAZON SOCIAL traía el nombre del centro comercial (`CENTRO COMERCIAL PLAZA SAN MIGUEL`) | Sale del directorio por RUC: `MALL SERVICE S.A.C.` |
+| En las facturas de Cencosud la RAZON SOCIAL era el encabezado de la tabla (`CODIGO DESCRIPCIÓN UM CAN...`) | Ni el encabezado de la tabla ni un nombre comercial pueden ir a esa columna |
+| Plaza San Miguel factura los gastos comunes como "Mantenimiento" | Para ese RUC, `Mantenimiento` entra como **GASTOS COMUNES** |
+| Una factura de Real Plaza salía con dos filas: la renta variable y, otra vez, las ventas del mes (`VTAS: 253525.77`) | Esa segunda línea es la continuación del concepto: aporta el mes, no una fila |
+| Las tres líneas de una factura de Cencosud salían con el mismo local | Cada línea sale con el local que lleva escrito (`- LC Local S2012`) |
+| Los importes de Cencosud salían con IGV, inflados un 18% | Se detecta y se baja a valor de venta (4.344,03 → 3.681,38) |
+
+**Para añadir un proveedor nuevo** (cuando la razón social no se pueda leer):
+una línea en `forus_emisores.py` con su RUC y su razón social. Si no está en el
+directorio, se intenta leer el logo por OCR, y si aun así no sale, la fila
+queda marcada en Observaciones diciendo qué RUC falta añadir.
+
+**Para añadir un concepto nuevo**: una línea en `forus_conceptos.py`. Si un
+emisor llama a un gasto de una manera que choca con el resto, va en
+`REGLAS_POR_EMISOR` con su RUC.
+
+**Pruebas**: `python pruebas_arriendos.py` lee el texto de una factura de cada
+centro comercial y comprueba tienda, mes, concepto e importe de cada fila.
 
 ---
 

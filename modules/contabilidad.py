@@ -252,7 +252,7 @@ def extraer_cabecera(text, pagina_inicial, paginas):
         "Correlativo": correlativo or None,
         "Numero": numero,
         "RUC Emisor": ruc_emisor,
-        "Razon Social Emisor": find_nombre_emisor(text, excluir=("FORUS",)),
+        "Razon Social Emisor": find_nombre_emisor(text, excluir=("FORUS",), ruc=ruc_emisor),
         "RUC Cliente": ruc_cliente,
         "Razon Social Cliente": find_label_value(text, [
             "SENOR(ES)", "SENORES", "SENOR", "CLIENTE", "ADQUIRIENTE",

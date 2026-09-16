@@ -55,6 +55,7 @@ NORMALIZACION = [
 
     # --- renta ---
     (r"(?:CONTRAPRESTACION|RENTA|ARRIENDO|ALQUILER).*VARIABLE", "RENTA VARIABLE"),
+    (r"VALOR\s+PORCENTUAL", "RENTA VARIABLE"),
     (r"VARIABLE.*(?:CONTRAPRESTACION|RENTA|ARRIENDO)", "RENTA VARIABLE"),
     (r"(?:CONTRAPRESTACION|RENTA|ARRIENDO|ALQUILER).*MINIM", "RENTA MINIMA"),
     (r"MINIM.*(?:CONTRAPRESTACION|RENTA|ARRIENDO)", "RENTA MINIMA"),
@@ -81,11 +82,36 @@ NORMALIZACION = [
     (r"SERVICIOS\s+COMERCIALES", "SERVICIOS COMERCIALES"),
     (r"ESTACIONAMIENTO|PLAYA\s+DE\s+ESTACIONAMIENTO", "ESTACIONAMIENTO"),
 
+    # --- gastos de administracion del centro comercial ---
+    (r"GASTO.*ADMINISTRA|ADMINISTRACION\s+DEL?\s+CENTRO", "GASTOS ADMINISTRATIVOS"),
+
     # --- financieros ---
+    (r"INTERES.*PUNITORIO|PUNITORIO", "INTERESES"),
     (r"INTERES.*MORATORIO|MORA\b|PAGO\s+TARDIO", "INTERESES MORATORIOS"),
     (r"\bPENALIDAD\b", "PENALIDAD"),
     (r"\bREAJUSTE\b|INFLACION|\bIPC\b", "REAJUSTE"),
 ]
+
+
+# Cada emisor tiene su manera de llamar a lo mismo, y a veces choca con el
+# nombre general. Plaza San Miguel factura los gastos comunes del local bajo el
+# titulo "Mantenimiento": en su factura eso no es el mantenimiento del local,
+# es el gasto comun, y asi tiene que entrar al control.
+#
+# PARA ANADIR UNA EXCEPCION: el RUC del emisor y la lista de (patron, nombre).
+# Se revisan antes que la tabla general y gana la primera que encaja.
+REGLAS_POR_EMISOR = {
+    "20113126087": [  # MALL SERVICE S.A.C. - C.C. Plaza San Miguel
+        (r"MANTENIMIENTO", "GASTOS COMUNES"),
+    ],
+}
+
+
+def _reglas_del_emisor(ruc):
+    if not ruc:
+        return []
+    digitos = "".join(caracter for caracter in str(ruc) if caracter.isdigit())
+    return REGLAS_POR_EMISOR.get(digitos, [])
 
 
 def _limpiar(texto):
@@ -110,7 +136,7 @@ def _limpiar(texto):
 SUFIJOS = [(r"\bALMACEN\b|\bDEPOSITO\b", "ALMACEN")]
 
 
-def normalizar_concepto(texto):
+def normalizar_concepto(texto, ruc=None):
     """Nombre canonico del gasto, o None si no se reconoce.
 
     Devuelve None a proposito cuando no encaja en ninguna regla: es preferible
@@ -120,6 +146,11 @@ def normalizar_concepto(texto):
     limpio = _limpiar(texto)
     if not limpio:
         return None
+
+    # Lo que este emisor llama distinto al resto manda sobre la tabla general.
+    for patron, canonico in _reglas_del_emisor(ruc):
+        if re.search(patron, limpio):
+            return canonico
 
     trimestre = None
     for patron, etiqueta in ORDINALES:
@@ -144,15 +175,22 @@ def normalizar_concepto(texto):
     return None
 
 
-def concepto_o_original(texto):
+def concepto_o_original(texto, ruc=None, respaldo=None):
     """El nombre canonico y, si no lo hay, la descripcion limpia.
 
     Devuelve (concepto, reconocido) para que quien llame pueda marcar la fila
-    cuando el concepto no se pudo normalizar.
+    cuando el concepto no se pudo normalizar. `respaldo` es la continuacion de
+    la linea: algunas facturas parten la descripcion en dos y el nombre del
+    gasto esta en la segunda mitad.
     """
-    canonico = normalizar_concepto(texto)
+    canonico = normalizar_concepto(texto, ruc=ruc)
     if canonico:
         return canonico, True
+
+    if respaldo:
+        canonico = normalizar_concepto(f"{texto} {respaldo}", ruc=ruc)
+        if canonico:
+            return canonico, True
 
     limpio = _limpiar(texto)
     return (limpio or collapse_spaces(texto)), False

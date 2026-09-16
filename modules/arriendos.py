@@ -237,25 +237,36 @@ def numerar_documento(texto):
 def mes_del_concepto(fila, texto_documento, cabecera):
     """Mes facturado, con el orden de prioridad que pidio Contabilidad.
 
+    Lo de la propia linea manda sobre lo del documento: una misma factura de
+    Cencosud trae conceptos de julio y de setiembre, y si se mira solo el
+    documento todas las filas salen con el mismo mes.
+
     La fecha de emision es el ultimo recurso y siempre queda anotado: una
     factura emitida el 05/08 que dice "CORRESPONDIENTE DEL 01.07 AL 31.07" es
     de JULIO, no de agosto.
     """
-    # 1) Periodo escrito en la propia linea del concepto.
+    # 1) Periodo escrito en la propia linea del concepto (o en su continuacion).
     if fila.get("desde"):
         return mes_de_fecha(fila["desde"]), fila["desde"], None
 
-    # 2) Periodo declarado en cualquier parte del documento.
+    # 2) Mes con letras en la propia linea: "AGOSTO 2026 - RENTA VARIABLE".
+    propio = buscar_mes_escrito(
+        " ".join(x for x in [fila.get("concepto"), fila.get("continuacion")] if x)
+    )
+    if propio:
+        return propio, None, None
+
+    # 3) Periodo declarado en cualquier parte del documento.
     desde, _ = buscar_periodo_documento(texto_documento)
     if desde:
         return mes_de_fecha(desde), desde, None
 
-    # 3) Mes escrito con letras, "JULIO 2026 - GASTO COMUN FIJO".
+    # 4) Mes escrito con letras, "JULIO 2026 - GASTO COMUN FIJO".
     escrito = buscar_mes_escrito(texto_documento)
     if escrito:
         return escrito, None, None
 
-    # 4) Solo entonces, el mes de emision, y avisando.
+    # 5) Solo entonces, el mes de emision, y avisando.
     mes = mes_de_fecha(cabecera.get("Fecha"))
     if mes:
         return mes, None, "MES tomado de la fecha de emision: verificar"
@@ -309,32 +320,84 @@ def descartar_duplicados(filas):
     return resultado
 
 
-def elegir_columna_valor(filas, base_imponible):
-    """Posicion (contada desde el final) de la columna con el valor sin IGV.
+def tolerancia_suma(filas):
+    """Cuanto se admite de diferencia al cuadrar: un centimo por linea."""
+    return 0.10 + 0.01 * len(filas)
 
-    Se prueba cada columna y se queda la primera cuya suma cuadra con la base
-    imponible del documento. Si no hay base con que comparar, se usa el ultimo
-    importe de la fila, que es lo habitual.
+
+def elegir_columna_valor(filas, base_imponible, total_documento=None):
+    """Que columna de la tabla es el valor de venta, y si viene con IGV.
+
+    Devuelve (posicion, cuadra, factor). La posicion se cuenta desde el final
+    porque cada emisor pone las columnas en un orden distinto.
+
+    Se prueban dos cuadres, en este orden:
+
+    1. Contra la base imponible: la columna cuya suma da las operaciones
+       gravadas mas inafectas es el valor de venta sin IGV, que es el que va al
+       control.
+    2. Contra el importe total: hay emisores -Cencosud es el caso tipico- que
+       en la tabla solo imprimen el precio de venta, ya con IGV. Entonces se
+       coge esa columna y se devuelve el factor con el que hay que bajarla a
+       valor de venta, para que el control no quede inflado un 18%.
     """
     if not filas:
-        return -1, False
+        return -1, False, 1.0
 
     if base_imponible is None:
-        return -1, False
+        return -1, False, 1.0
 
     maximo = max(len(fila["numeros"]) for fila in filas)
-    for posicion in range(1, maximo + 1):
-        suma = 0
-        completa = True
+    tolerancia = tolerancia_suma(filas)
+
+    def suma_columna(posicion):
+        total = 0
         for fila in filas:
             if len(fila["numeros"]) < posicion:
-                completa = False
-                break
-            suma += fila["numeros"][-posicion]
-        if completa and abs(suma - base_imponible) <= 0.10:
-            return -posicion, True
+                return None
+            total += fila["numeros"][-posicion]
+        return total
 
-    return -1, False
+    for posicion in range(1, maximo + 1):
+        suma = suma_columna(posicion)
+        if suma is not None and abs(suma - base_imponible) <= tolerancia:
+            return -posicion, True, 1.0
+
+    # La tabla trae los importes con IGV: se identifican porque suman el total.
+    if total_documento and total_documento > base_imponible > 0:
+        for posicion in range(1, maximo + 1):
+            suma = suma_columna(posicion)
+            if suma is not None and abs(suma - total_documento) <= tolerancia:
+                return -posicion, True, base_imponible / suma
+
+    return -1, False, 1.0
+
+
+def valores_sin_igv(filas, posicion, factor, base_imponible):
+    """Importe de cada linea ya sin IGV, cuadrando la suma con la base.
+
+    Al bajar cada linea por separado sobran o faltan centimos; el resto se
+    carga a la linea mas grande, que es donde menos se nota, para que la suma
+    de las filas sea exactamente la base imponible de la factura.
+    """
+    brutos = [
+        fila["numeros"][posicion] if len(fila["numeros"]) >= abs(posicion)
+        else fila["numeros"][-1]
+        for fila in filas
+    ]
+
+    if factor == 1.0:
+        return brutos, brutos
+
+    netos = [round(bruto * factor, 2) for bruto in brutos]
+
+    if base_imponible is not None and netos:
+        diferencia = round(base_imponible - sum(netos), 2)
+        if diferencia:
+            mayor = max(range(len(netos)), key=lambda indice: abs(netos[indice]))
+            netos[mayor] = round(netos[mayor] + diferencia, 2)
+
+    return netos, brutos
 
 
 def extraer_cabecera(texto, pagina_inicial):
@@ -363,6 +426,7 @@ def extraer_cabecera(texto, pagina_inicial):
         if deducida is not None:
             gravadas, igv, total = deducida, igv_deducido, total_deducido
 
+    ruc = find_ruc(texto, ["R.U.C.", "RUC"])
     local = extraer_local(texto)
     # "LOCAL COMERCIAL" a veces es solo un encabezado de columna y lo que sigue
     # en la linea es otro encabezado, no un valor.
@@ -380,8 +444,13 @@ def extraer_cabecera(texto, pagina_inicial):
         "Fecha Vencimiento": find_date(texto, [
             "FECHA DE VENCIMIENTO", "FECHA VENCIMIENTO", "FECHA VENC",
         ]),
-        "RUC Emisor": find_ruc(texto, ["R.U.C.", "RUC"]),
-        "RAZON SOCIAL": find_nombre_emisor(texto, excluir=("FORUS",)),
+        "RUC Emisor": ruc,
+        # El RUC manda: muchos emisores llevan su razon social dentro del logo,
+        # que es una imagen, y de la cabecera solo se puede leer el nombre
+        # comercial del centro comercial.
+        "RAZON SOCIAL": en_mayusculas(
+            find_nombre_emisor(texto, excluir=("FORUS",), ruc=ruc)
+        ),
         "Contrato": find_label_value(texto, [
             "NRO. DE CONTRATO", "NUMERO DE CONTRATO", "NUM CONTRATO",
             "N. CONTRATO", "NRO CONTRATO", "CONTRATO",
@@ -412,26 +481,29 @@ def extraer_cabecera(texto, pagina_inicial):
 def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documento=None):
     """Convierte cada concepto en una fila del control."""
     base = cabecera.get("_base")
-    posicion, cuadro = elegir_columna_valor(filas_detalle, base)
+    total_documento = cabecera.get("Importe Total")
+    posicion, cuadro, factor = elegir_columna_valor(filas_detalle, base, total_documento)
     moneda = cabecera.get("Moneda")
-    igv_total = cabecera.get("IGV") or 0
-    suma_base = sum(
-        fila["numeros"][posicion] for fila in filas_detalle
-        if len(fila["numeros"]) >= abs(posicion)
-    )
+    ruc = cabecera.get("RUC Emisor")
 
-    # La columna Tienda lleva el local cuando la factura lo trae y, si no, el
-    # numero de contrato: es lo que identifica el punto en cada proveedor.
-    tienda = (
+    netos, brutos = valores_sin_igv(filas_detalle, posicion, factor, base)
+    suma_base = sum(valor for valor in netos if valor is not None)
+    igv_total = cabecera.get("IGV") or 0
+
+    # El local de la cabecera solo vale cuando la linea no trae el suyo: una
+    # misma factura de Cencosud cobra tres locales distintos, uno por linea, y
+    # antes salian los tres con el primero.
+    tienda_documento = (
         cabecera.get("Local / Tienda")
         or cabecera.get("Contrato")
         or cabecera.get("Referencia")
     )
 
     control = []
-    for fila in filas_detalle:
-        numeros = fila["numeros"]
-        valor = numeros[posicion] if len(numeros) >= abs(posicion) else numeros[-1]
+    for indice, fila in enumerate(filas_detalle):
+        valor = netos[indice]
+        bruto = brutos[indice]
+        tienda = fila.get("local") or tienda_documento
 
         mes, periodo_desde, aviso_mes = mes_del_concepto(
             fila, mes_documento or "", cabecera
@@ -442,20 +514,33 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
 
         # El concepto se traduce a su nombre canonico; si no se reconoce, se
         # deja la descripcion limpia y se marca para revision.
-        concepto, reconocido = concepto_o_original(fila["concepto"])
+        concepto, reconocido = concepto_o_original(
+            fila["concepto"], ruc=ruc, respaldo=fila.get("continuacion"),
+        )
         if not reconocido:
             notas.append("Concepto sin normalizar: revisar")
         if not tienda:
             notas.append("Sin local ni contrato en el documento: completar a mano")
+        if not cabecera.get("RAZON SOCIAL"):
+            notas.append(
+                "Sin razon social: este emisor la imprime dentro del logo. "
+                f"Anade el RUC {ruc or ''} a forus_emisores.py".strip()
+            )
+        if factor != 1.0:
+            notas.append("La factura solo trae el importe con IGV: se convirtio a valor de venta")
         if not cuadro and base is not None:
             notas.append("El detalle no cuadra con la base imponible")
         if base is None:
             notas.append("Sin totales para verificar el importe")
 
-        # El IGV del documento se reparte entre conceptos segun su peso.
-        con_igv = None
-        if valor is not None and suma_base:
+        # Con IGV: el importe tal como lo imprime la factura cuando ya viene
+        # asi, y si no, el valor de venta mas la parte de IGV que le toca.
+        if factor != 1.0:
+            con_igv = bruto
+        elif valor is not None and suma_base:
             con_igv = round(valor + igv_total * (valor / suma_base), 2)
+        else:
+            con_igv = None
 
         control.append({
             "Fecha": fecha_es(cabecera.get("Fecha")),
@@ -468,7 +553,7 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
             "RAZON SOCIAL": cabecera.get("RAZON SOCIAL"),
             "FECHA DE ENTREGA": None,  # no viene en el PDF, se completa a mano
             "Contrato": cabecera.get("Contrato"),
-            "Local": cabecera.get("Local / Tienda"),
+            "Local": tienda,
             "Tipo Documento": cabecera.get("Tipo Documento"),
             "Periodo Desde": fila["desde"],
             "Periodo Hasta": fila["hasta"],
@@ -495,8 +580,28 @@ def leer_paginas(uploaded_file):
     return paginas
 
 
+def en_mayusculas(texto):
+    """La razon social se lleva en mayusculas, venga de donde venga."""
+    limpio = collapse_spaces(texto)
+    return limpio.upper() if limpio else None
+
+
+def razon_social_por_ocr(datos_pdf, pagina, texto):
+    """Ultimo recurso para el nombre del emisor: leer el logo por OCR.
+
+    Solo se llega aqui cuando el RUC no esta en el directorio y la cabecera no
+    trae el nombre como texto. Se lee unicamente la franja de arriba de la
+    pagina, que es donde va el logo, y se busca ahi una razon social.
+    """
+    texto_cabecera = forus_ocr.texto_de_cabecera_por_ocr(datos_pdf, pagina)
+    if not texto_cabecera:
+        return None
+    return en_mayusculas(find_nombre_emisor(texto_cabecera, excluir=("FORUS",)))
+
+
 def process_pdf(uploaded_file):
     """Devuelve (control, facturas, auditoria) para un PDF."""
+    datos_pdf = uploaded_file.getvalue()
     paginas = leer_paginas(uploaded_file)
     documentos = agrupar_documentos(paginas)
 
@@ -533,6 +638,14 @@ def process_pdf(uploaded_file):
                 cabecera["Contrato"] = find_label_value(texto_anexos, [
                     "NUM CONTRATO", "NUMERO DE CONTRATO", "N. CONTRATO", "CONTRATO",
                 ], max_chars=30, requiere_separador=True)
+
+        # La razon social del emisor esta dentro del logo en bastantes
+        # facturas: si no vino en el texto ni esta en el directorio de RUCs, se
+        # intenta leer el logo por OCR antes de dejar la columna vacia.
+        if not cabecera.get("RAZON SOCIAL"):
+            cabecera["RAZON SOCIAL"] = razon_social_por_ocr(
+                datos_pdf, documento["pagina_inicial"], texto,
+            )
 
         filas_detalle = extraer_lineas_detalle(texto)
         control, suma_base, cuadro = construir_filas_control(

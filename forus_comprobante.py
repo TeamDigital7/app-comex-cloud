@@ -212,9 +212,29 @@ RUIDO_DETALLE = (
 UNIDADES = {
     "UN", "UND", "UNI", "NIU", "ZZ", "LOCALES", "SER", "KGM", "KG", "MTR",
     "M2", "M3", "GLL", "PZA", "DIA", "DIAS", "MES", "MESES", "SET", "DOC",
+    "ST", "SRV", "GLN",
 }
 
 CONECTORES_SUELTOS = {"DEL", "AL", "DE", "A", "-", "AL.", "Y"}
+
+# Codigo de material de las facturas SAP (Cencosud): ZPGJ, ZREL, ZRAC, ZINT,
+# ZREP, ZADP, ZVPM. Son cuatro letras que empiezan por Z y van delante de la
+# descripcion; sin quitarlas el concepto no se puede normalizar.
+CODIGO_SAP_RE = re.compile(r"^Z[A-Z]{3}$")
+
+# El local dentro de la linea del concepto: "- LC Local S2012", "- LC 5A",
+# "- LC M1104". Una misma factura puede traer varios locales, uno por linea,
+# asi que este dato manda sobre el local de la cabecera.
+LOCAL_EN_LINEA_RE = re.compile(
+    r"\bLC\s+(?:LOCAL\s+)?([A-Z]{0,3}\d{1,5}[A-Z]?(?:\s*[/-]\s*[A-Z]{0,2}\d{1,5}[A-Z]?)*)\b",
+    re.I,
+)
+
+# Una linea que continua el concepto de la de arriba, no un concepto nuevo:
+# "*01.09.2026-30.09.2026-Gastos Fijos - LC Local S2012" (Cencosud) o
+# "AGOSTO 2026 - RENTA VARIABLE - %RV: 8.50 - VTAS: 253525.77" (Real Plaza),
+# donde ese numero es la venta del mes y no un importe que se cobre.
+INICIO_CONTINUACION_RE = re.compile(r"^\s*[*+>.\-]")
 
 # Una linea de concepto acaba en dos a cinco importes separados por espacios.
 LINEA_DETALLE_RE = re.compile(
@@ -273,6 +293,11 @@ def limpiar_concepto(cuerpo, periodo_texto):
             codigo = token
             tokens.pop(0)
             continue
+        # Codigo de material SAP: solo se quita si detras queda descripcion.
+        if codigo is None and CODIGO_SAP_RE.fullmatch(plano) and len(tokens) > 1:
+            codigo = token
+            tokens.pop(0)
+            continue
         break
 
     # Cola: unidad y conectores que quedaron sueltos al quitar el periodo.
@@ -288,9 +313,45 @@ def limpiar_concepto(cuerpo, periodo_texto):
     return collapse_spaces(" ".join(tokens)), codigo, cantidad, unidad
 
 
+def _local_de_linea(texto):
+    """Local escrito dentro de la linea del concepto, si lo trae."""
+    match = LOCAL_EN_LINEA_RE.search(normalize(texto or ""))
+    if not match:
+        return None
+    return collapse_spaces(match.group(1))
+
+
+def _es_fila_de_concepto(linea, numeros, columnas):
+    """Si la linea abre un concepto nuevo o solo continua el de arriba.
+
+    Las facturas parten un concepto en dos lineas mas a menudo de lo que
+    parece: Cencosud pone debajo el periodo y el local ("*01.09.2026-
+    30.09.2026-Gastos Fijos - LC Local S2012") y Real Plaza, el detalle del
+    calculo de la renta variable ("AGOSTO 2026 - RENTA VARIABLE - %RV: 8.50 -
+    VTAS: 253525.77"). Esa segunda linea no es un cobro: si se toma como
+    concepto, la factura sale con una fila de mas y con las ventas del mes
+    metidas como si fueran un importe a pagar.
+
+    La senal que distingue una de otra es la forma de la fila: los conceptos de
+    verdad traen todas las columnas de importes de la tabla -cantidad, valor
+    unitario, total-, y las continuaciones traen a lo sumo un numero suelto.
+    """
+    if INICIO_CONTINUACION_RE.match(linea):
+        return False
+    # La tabla tiene varias columnas de importes: una linea con un solo numero
+    # no es una fila de la tabla.
+    if columnas >= 2 and len(numeros) < 2:
+        return False
+    return True
+
+
 def extraer_lineas_detalle(texto):
-    """Conceptos de la factura, cada uno con todos sus importes de la fila."""
-    filas = []
+    """Conceptos de la factura, cada uno con todos sus importes de la fila.
+
+    Cada concepto sale con el periodo, el local y los importes de su propia
+    linea, incluido lo que venga escrito en las lineas de continuacion.
+    """
+    candidatos = []
 
     for linea in zona_detalle(texto):
         limpia = collapse_spaces(linea)
@@ -305,14 +366,35 @@ def extraer_lineas_detalle(texto):
 
         match = LINEA_DETALLE_RE.match(limpia)
         if not match:
+            # Sin importes al final no puede ser un concepto, pero si puede
+            # traer el periodo o el local del concepto de arriba.
+            candidatos.append((limpia, None, None))
             continue
 
         numeros = [parse_amount(token) for token in match.group("numeros").split()]
         numeros = [numero for numero in numeros if numero is not None]
-        if not numeros:
+        candidatos.append((limpia, match.group("cuerpo"), numeros))
+
+    # Cuantas columnas de importes tiene la tabla de esta factura. Se mide sobre
+    # las propias lineas para no depender del formato de cada emisor.
+    columnas = max(
+        [len(numeros) for _, cuerpo, numeros in candidatos if cuerpo and numeros],
+        default=0,
+    )
+
+    filas = []
+    for limpia, cuerpo, numeros in candidatos:
+        es_concepto = bool(cuerpo) and bool(numeros) and _es_fila_de_concepto(
+            limpia, numeros, columnas
+        )
+
+        if not es_concepto:
+            if filas:  # continuacion del concepto anterior
+                filas[-1]["continuacion"] = collapse_spaces(
+                    " ".join(x for x in [filas[-1]["continuacion"], limpia] if x)
+                )
             continue
 
-        cuerpo = match.group("cuerpo")
         desde, hasta, periodo_texto = extraer_periodo(cuerpo)
         concepto, codigo, cantidad, unidad = limpiar_concepto(cuerpo, periodo_texto)
 
@@ -327,6 +409,20 @@ def extraer_lineas_detalle(texto):
             "desde": desde,
             "hasta": hasta,
             "numeros": numeros,
+            "local": _local_de_linea(cuerpo),
+            "continuacion": None,
         })
+
+    # Lo que quedo en la linea de continuacion completa el concepto: de ahi
+    # salen el periodo y el local cuando el emisor no los pone en la primera.
+    for fila in filas:
+        continuacion = fila.get("continuacion")
+        if not continuacion:
+            continue
+        if not fila["desde"]:
+            desde, hasta, _ = extraer_periodo(continuacion)
+            fila["desde"], fila["hasta"] = desde, hasta
+        if not fila["local"]:
+            fila["local"] = _local_de_linea(continuacion)
 
     return filas

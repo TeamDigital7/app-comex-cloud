@@ -547,6 +547,8 @@ COLA_TITULO_RE = re.compile(
 
 def _nombre_plausible(linea):
     """Si una linea puede ser el nombre del emisor."""
+    from forus_emisores import es_encabezado_de_tabla, es_nombre_comercial
+
     limpia = collapse_spaces(COLA_TITULO_RE.sub("", linea or "")) or ""
     plano = normalize(limpia)
 
@@ -560,19 +562,79 @@ def _nombre_plausible(linea):
         return None
     if len(re.findall(r"[A-Z]", plano)) < 6:
         return None
+    # El encabezado de la tabla ("CODIGO DESCRIPCION UM CANTIDAD...") no es el
+    # nombre de nadie, y el nombre comercial del centro comercial tampoco es la
+    # razon social a la que se le paga.
+    if es_encabezado_de_tabla(limpia) or es_nombre_comercial(limpia):
+        return None
     return limpia
 
 
-def find_nombre_emisor(text, excluir=()):
+# Razon social metida dentro de una linea con mas cosas. Hace falta para el
+# texto que devuelve el OCR, que junta el logo con la direccion y el RUC en un
+# solo renglon: "MALL SERVICE S.A.C. RUC: 20113126087".
+RAZON_SOCIAL_EMBEBIDA_RE = re.compile(
+    r"(?i)\b([A-Z\xc1\xc9\xcd\xd3\xda\xd1][\w\xc1\xc9\xcd\xd3\xda\xd1\xe1\xe9\xed\xf3\xfa\xf1&.\-]*"
+    r"(?:\s+[\w\xc1\xc9\xcd\xd3\xda\xd1\xe1\xe9\xed\xf3\xfa\xf1&.\-]+){0,6}?\s+"
+    r"(?:S\.?\s*A\.?\s*C\.?|S\.?\s*A\.?\s*A\.?|S\.?\s*R\.?\s*L\.?"
+    r"|E\.?\s*I\.?\s*R\.?\s*L\.?|S\.?\s*A\.?|SAC|SRL|SAA|EIRL))(?:\s|$|,)"
+)
+
+
+def find_razon_social_embebida(text, excluir=()):
+    """Razon social que comparte renglon con otros datos.
+
+    Es lo que pasa con el texto del OCR: el nombre del logo sale pegado a la
+    direccion y al RUC. Se busca el trozo que termina en forma societaria y se
+    descarta el del cliente.
+    """
+    excluir_plano = [normalize(termino) for termino in excluir]
+
+    for linea in split_lines(text)[:12]:
+        for match in RAZON_SOCIAL_EMBEBIDA_RE.finditer(linea):
+            nombre = collapse_spaces(match.group(1))
+            if not nombre or len(nombre) < 6:
+                continue
+            plano = normalize(nombre)
+            if any(termino in plano for termino in excluir_plano):
+                continue
+            if any(plano.startswith(titulo) for titulo in TITULOS_DOCUMENTO):
+                continue
+            if re.search(r"\d{3,}", plano):
+                continue
+            if len(re.findall(r"[A-Z]", plano)) < 6:
+                continue
+            return nombre
+
+    return None
+
+
+def find_nombre_emisor(text, excluir=(), ruc=None):
     """Nombre del emisor, tenga o no forma societaria.
 
-    Primero se busca una razon social con su sufijo (S.A.C., S.R.L. ...). Si no
-    la hay -universidades, nombres comerciales- se toma la primera linea de la
-    cabecera que pueda ser un nombre y no sea un titulo ni una direccion.
+    El orden importa y responde a como estan hechas las facturas:
+
+    1. El directorio por RUC. Es lo mas fiable porque muchos emisores llevan su
+       razon social dentro del logo, que es una imagen: ese texto no esta en el
+       PDF y no hay forma de leerlo de la cabecera.
+    2. Una razon social con su sufijo (S.A.C., S.R.L. ...) en la cabecera.
+    3. Cualquier linea que pueda ser un nombre -universidades, entidades sin
+       forma societaria-, descartando titulos, direcciones, encabezados de
+       tabla y nombres comerciales de centros comerciales.
     """
+    from forus_emisores import razon_social_por_ruc
+
+    registrada = razon_social_por_ruc(ruc)
+    if registrada:
+        return registrada
+
     societaria = find_razon_social_emisor(text, excluir=excluir)
     if societaria:
         return societaria
+
+    embebida = find_razon_social_embebida(text, excluir=excluir)
+    if embebida:
+        return embebida
 
     excluir_plano = [normalize(termino) for termino in excluir]
     for linea in split_lines(text)[:12]:
