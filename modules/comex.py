@@ -1,4 +1,4 @@
-"""Modulo Comex: lectura de facturas comerciales de proveedor (Columbia, Vans, Parfois)."""
+"""Modulo Comex: lectura de facturas comerciales de proveedor (Columbia, Vans, Parfois, Patagonia)."""
 import html
 import io
 import re
@@ -22,6 +22,7 @@ SUFIJOS_MARCA = {
     "_CLB.pdf": "COLUMBIA",
     "_PRF.pdf": "PARFOIS",
     "_VNS.pdf": "VANS",
+    "_PTG.pdf": "PATAGONIA",
 }
 
 def get_brand_from_filename(filename):
@@ -679,6 +680,258 @@ def process_parfois_pdf(uploaded_file):
     return detail_rows, summary_rows, invoice_rows, audit_rows
 
 
+# Patagonia Chile emite una "Factura de Exportacion" del SII por pagina. El texto
+# plano sale desordenado (el pais "SRI LANKA" o "U. S. A." se parte en dos
+# lineas), asi que las filas se arman por la posicion horizontal de cada palabra.
+# Limites de columna en puntos, medidos sobre las muestras (pagina de 595 pt).
+PATAGONIA_COLUMNAS = [
+    ("codigo", 0, 75),
+    ("color_talla", 75, 198),
+    ("articulo", 198, 400),
+    ("cantidad", 400, 438),
+    ("precio", 438, 520),
+    ("total", 520, 10_000),
+]
+
+
+def patagonia_line_rows(page):
+    """Agrupa las palabras de la tabla de items por linea y por columna."""
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+
+    header = next((w for w in words if w["text"] == "CODIGO"), None)
+    footer = next((w for w in words if w["text"] == "DOCUMENTO" and header and w["top"] > header["top"]), None)
+    if not header:
+        return []
+
+    top_limit = header["bottom"] + 2
+    bottom_limit = footer["top"] - 1 if footer else page.height
+    body = [w for w in words if top_limit <= w["top"] < bottom_limit]
+    body.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+
+    lines = []
+    for word in body:
+        if lines and abs(lines[-1]["top"] - word["top"]) <= 1.5:
+            lines[-1]["words"].append(word)
+        else:
+            lines.append({"top": word["top"], "words": [word]})
+
+    rows = []
+    for line in lines:
+        cells = {}
+        for name, x_min, x_max in PATAGONIA_COLUMNAS:
+            column_words = sorted(
+                (w for w in line["words"] if x_min <= w["x0"] < x_max),
+                key=lambda w: w["x0"],
+            )
+            text = ""
+            previous = None
+            for w in column_words:
+                # Palabras pegadas (separadas por menos de medio punto) son una sola.
+                if previous is not None and w["x0"] - previous["x1"] > 0.5:
+                    text += " "
+                text += w["text"]
+                previous = w
+            cells[name] = text
+        rows.append(cells)
+    return rows
+
+
+def parse_patagonia_color_talla(value):
+    """'BLK-XS-SRI LANKA-6108920005' -> color, talla, origen, HTS."""
+    text = re.sub(r"\s+", " ", value or "").strip()
+    # Color y talla pueden venir vacios (un libro: "--ESPAÑA-4901990093").
+    match = re.match(r"^([^-\s]*)-([^-\s]*)-(.+?)-\s*(\d{6,10})$", text)
+    if not match:
+        return None, None, None, None
+    origin = match.group(3).strip()
+    # "U. S. A." -> "U.S.A."
+    origin = re.sub(r"(?<=\.)\s+(?=[A-Z]\.)", "", origin)
+    return clean_text(match.group(1)), clean_text(match.group(2)), origin, match.group(4)
+
+
+def parse_patagonia_header(text):
+    invoice_number = None
+    m_invoice = re.search(r"N[º°o]\s*(\d{3,12})", text)
+    if m_invoice:
+        invoice_number = m_invoice.group(1)
+
+    invoice_date = None
+    m_date = re.search(r"EMISI[ÓO]N\s*:\s*(\d{2}-\d{2}-\d{4})", text)
+    if m_date:
+        invoice_date = m_date.group(1)
+
+    cartons = None
+    m_cartons = re.search(r"TOTAL\s+BULTOS\s*:\s*([\d.,]+)", text)
+    if m_cartons:
+        cartons = parse_quantity(m_cartons.group(1))
+
+    invoice_total = None
+    m_total = re.search(r"^TOTAL\s*\$\s*:\s*([\d.,]+)", text, flags=re.MULTILINE)
+    if m_total:
+        invoice_total = parse_money(m_total.group(1))
+
+    observation = None
+    m_obs = re.search(r"OBSERVACION\s*:\s*\n?\s*(\S+)", text)
+    if m_obs and not m_obs.group(1).startswith("Timbre"):
+        observation = m_obs.group(1)
+
+    return {
+        "invoice_number": invoice_number,
+        "invoice_date": invoice_date,
+        "order_no": observation,
+        "customer_po": None,
+        "brand": "PATAGONIA",
+        "cartons": cartons,
+        "invoice_total": invoice_total,
+        "invoice_pages": 1,
+    }
+
+
+def parse_patagonia_items(line_rows):
+    """Une cada item con sus lineas de continuacion y lo separa en campos."""
+    raw_items = []
+    for cells in line_rows:
+        code = cells["codigo"].replace(" ", "")
+        # El codigo suele ser numerico (55257), pero hay alfanumericos (BK825000ALL).
+        if re.fullmatch(r"(?=.*\d)[A-Z0-9]{3,}", code) and cells["cantidad"]:
+            raw_items.append({
+                "code": code,
+                "color_talla": [cells["color_talla"]],
+                "articulo": [cells["articulo"]],
+                "cantidad": cells["cantidad"],
+                "precio": cells["precio"],
+                "total": cells["total"],
+            })
+        elif raw_items:
+            if cells["color_talla"]:
+                raw_items[-1]["color_talla"].append(cells["color_talla"])
+            if cells["articulo"]:
+                raw_items[-1]["articulo"].append(cells["articulo"])
+
+    items = []
+    for raw in raw_items:
+        color, size, origin, hs = parse_patagonia_color_talla(" ".join(raw["color_talla"]))
+        article = re.sub(r"\s+", " ", " ".join(raw["articulo"])).strip()
+        if ":" in article:
+            style_desc, composition = article.split(":", 1)
+        else:
+            style_desc, composition = article, ""
+        items.append({
+            "style": raw["code"],
+            "style_desc": clean_text(style_desc),
+            "composition": clean_composition_text(composition),
+            "color": color,
+            "size": size,
+            "made_in": origin,
+            "hs": hs,
+            "quantity": parse_quantity(raw["cantidad"]),
+            "unit_price": parse_money(raw["precio"]),
+            "amount": parse_money(raw["total"]),
+        })
+    return items
+
+
+def process_patagonia_pdf(uploaded_file):
+    detail_rows = []
+    audit_rows = []
+    headers = {}
+    invoice_order = []
+    current_invoice = None
+
+    with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
+        total_pages = len(pdf.pages)
+
+        for page_number, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            page_header = parse_patagonia_header(text)
+            is_invoice = "FACTURA" in text.upper() and page_header["invoice_number"]
+            invoice_number = page_header["invoice_number"] or current_invoice
+
+            if not is_invoice and not invoice_number:
+                audit_rows.append({"PDF File": uploaded_file.name, "Page": page_number, "Role": "other", "Invoice #": None})
+                continue
+
+            if invoice_number not in headers:
+                headers[invoice_number] = dict(page_header, start_page=page_number, invoice_pages=0)
+                invoice_order.append(invoice_number)
+                role = "invoice_start"
+            else:
+                role = "invoice_continuation"
+                header = headers[invoice_number]
+                # Si la factura sigue en otra pagina, el total va en la ultima.
+                for key in ("invoice_total", "cartons", "invoice_date", "order_no"):
+                    if page_header[key] is not None:
+                        header[key] = page_header[key]
+
+            current_invoice = invoice_number
+            headers[invoice_number]["invoice_pages"] += 1
+            audit_rows.append({"PDF File": uploaded_file.name, "Page": page_number, "Role": role, "Invoice #": invoice_number})
+
+            for item in parse_patagonia_items(patagonia_line_rows(page)):
+                detail_rows.append({"invoice": invoice_number, "page": page_number, **item})
+
+    rows = []
+    first_row_by_invoice = {}
+    for item in detail_rows:
+        header = headers[item["invoice"]]
+        if item["invoice"] not in first_row_by_invoice:
+            first_row_by_invoice[item["invoice"]] = len(rows)
+        rows.append({
+            "PDF File": uploaded_file.name,
+            "Start Page": item["page"],
+            "Invoice #": item["invoice"],
+            "Order No": header["order_no"],
+            "Brand": "PATAGONIA",
+            "Style": item["style"],
+            "Style Description": item["style_desc"],
+            "Composition": item["composition"],
+            "Color": item["color"],
+            "Color Description": item["color"],
+            "Size": item["size"],
+            "Quantity Shipped": item["quantity"],
+            "Base Price": item["unit_price"],
+            "Net Price": item["unit_price"],
+            "Cartons": 0,
+            "HS": item["hs"],
+            "Made in": item["made_in"],
+            "Customer PO": header["customer_po"],
+            "Invoice Date": header["invoice_date"],
+            "UM": None,
+            "Unit Discount": 0,
+            "Extended Price": item["amount"],
+            "Invoice Total USD": header["invoice_total"],
+            "Invoice Pages": header["invoice_pages"],
+        })
+
+    for invoice_number, idx in first_row_by_invoice.items():
+        rows[idx]["Cartons"] = headers[invoice_number]["cartons"] or 0
+
+    invoice_rows = build_invoice_summary(rows)
+    for row in invoice_rows:
+        row["PDF File"] = uploaded_file.name
+        row["Start Page"] = headers[row["Invoice #"]]["start_page"]
+
+    summary_rows = build_summary_rows(uploaded_file.name, total_pages, rows, invoice_rows, audit_rows)
+
+    # Control de cuadre: suma de lineas contra el TOTAL $ impreso en cada factura.
+    mismatches = []
+    for invoice_number in invoice_order:
+        printed = headers[invoice_number]["invoice_total"]
+        lines_total = round(sum(r["Extended Price"] or 0 for r in rows if r["Invoice #"] == invoice_number), 2)
+        if printed is None or abs(lines_total - printed) > 0.01:
+            mismatches.append(invoice_number)
+    summary_rows.append({
+        "Metric": "Invoice Total USD",
+        "Value": round(sum(headers[n]["invoice_total"] or 0 for n in invoice_order), 2),
+    })
+    summary_rows.append({
+        "Metric": "Invoices Not Matching Total",
+        "Value": ", ".join(mismatches) if mismatches else 0,
+    })
+
+    return rows, summary_rows, invoice_rows, audit_rows
+
+
 def build_summary_rows(pdf_name, total_pages, detail_rows, invoice_rows, audit_rows):
     return [
         {"Metric": "PDF File", "Value": pdf_name},
@@ -757,6 +1010,9 @@ def process_pdf(uploaded_file):
     if brand == "PARFOIS":
         return process_parfois_pdf(uploaded_file)
 
+    if brand == "PATAGONIA":
+        return process_patagonia_pdf(uploaded_file)
+
     return process_columbia_pdf(uploaded_file)
 
 
@@ -808,7 +1064,8 @@ def render_sidebar():
             <div class="side-card">
                 COLUMBIA / MOUNTAIN<br>
                 VANS<br>
-                PARFOIS
+                PARFOIS<br>
+                PATAGONIA
             </div>
             """,
             unsafe_allow_html=True,
@@ -819,7 +1076,7 @@ def render_sidebar():
             """
             <div class="side-note">
                 Nombres obligatorios:<br>
-                <b>_CLB.pdf</b>, <b>_VNS.pdf</b>, <b>_PRF.pdf</b>
+                <b>_CLB.pdf</b>, <b>_VNS.pdf</b>, <b>_PRF.pdf</b>, <b>_PTG.pdf</b>
             </div>
             """,
             unsafe_allow_html=True,
@@ -877,6 +1134,7 @@ def render():
                 <div class="rule-chip"><b>Columbia / Mountain</b>Archivos terminados en _CLB.pdf</div>
                 <div class="rule-chip"><b>Parfois</b>Archivos terminados en _PRF.pdf</div>
                 <div class="rule-chip"><b>Vans</b>Archivos terminados en _VNS.pdf</div>
+                <div class="rule-chip"><b>Patagonia</b>Archivos terminados en _PTG.pdf</div>
             </div>
         </div>
         """,
@@ -929,7 +1187,7 @@ def render():
         )
 
         if invalid_files:
-            st.warning("Estos archivos se ignoraran porque no terminan en _CLB.pdf, _PRF.pdf o _VNS.pdf:")
+            st.warning("Estos archivos se ignoraran porque no terminan en _CLB.pdf, _PRF.pdf, _VNS.pdf o _PTG.pdf:")
             st.write(invalid_files)
 
         if valid_files:

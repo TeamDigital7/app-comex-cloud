@@ -83,9 +83,20 @@ pantallas nuevas no aparecen.**
 
 Se eligen en el desplegable **Sitio destino** del panel lateral, en un paso.
 
-### Comex — sin cambios
+### Comex
 
-Idéntico a hoy: sufijos `_CLB.pdf`, `_VNS.pdf`, `_PRF.pdf` y el mismo Excel.
+Sufijos `_CLB.pdf`, `_VNS.pdf`, `_PRF.pdf` y el mismo Excel de siempre, más
+**Patagonia** con el sufijo **`_PTG.pdf`**.
+
+Patagonia lee las "Facturas de Exportación" de Patagonia Chile Limitada (una
+factura por página, aunque vengan unidas en un solo PDF). De cada línea saca
+código (Style), descripción, composición/descripción aduanera, color, talla,
+país de origen, HTS, cantidad, precio unitario y total; de la cabecera, el
+número de factura, la fecha de emisión, los bultos y el `TOTAL $`. La hoja
+**Resumen** agrega dos controles propios de Patagonia: la suma de los totales
+impresos y la lista de facturas cuya suma de líneas no cuadra con su `TOTAL $`
+(debe salir `0`). Con la muestra de 18 facturas (N° 638 a 655): 335 líneas,
+1.773 unidades, US$ 84.444,42, y las 18 cuadran.
 
 ### Contabilidad - Pagos
 
