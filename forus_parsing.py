@@ -384,19 +384,64 @@ TITULOS_DOCUMENTO = (
 )
 
 
-def find_razon_social_emisor(text, excluir=()):
-    """Razon social del proveedor: la primera linea que cierra con forma societaria.
+# El RUC con su etiqueta, para quitarlo de la linea y quedarse con lo demas:
+# hay cabeceras que ponen nombre y RUC juntos ("CENCOSUD RETAIL PERU S.A.
+# R.U.C. 20109072177"), y el OCR tambien suele juntarlos en una sola linea.
+RUC_EN_LINEA_RE = re.compile(
+    r"(?i)(?:\bR\.?\s*U\.?\s*C\.?\s*(?:N[°º.]?\s*)?[:.]?\s*)?\b(?:10|15|16|17|20)\d{9}\b"
+)
 
-    Si la linea anterior es parte del nombre (pasa cuando el RUC lo parte en
-    dos), se une. Las lineas de `excluir` -por ejemplo el nombre de la propia
-    empresa- se saltan para no confundir al emisor con el cliente.
+# Forma societaria escrita con puntos pero sin el ultimo ("S.A.C"): se completa
+# para que el mismo proveedor salga siempre igual.
+SUFIJO_SIN_PUNTO_FINAL_RE = re.compile(r"\b(S\.A\.C|S\.A\.A|S\.R\.L|E\.I\.R\.L|S\.A)$")
+
+
+def _sin_ruc(linea):
+    """La linea sin el RUC ni su etiqueta."""
+    return collapse_spaces(RUC_EN_LINEA_RE.sub(" ", linea or "")) or ""
+
+
+def _pulir_razon_social(nombre):
+    nombre = collapse_spaces(nombre) or ""
+    nombre = re.sub(r"\s+([.,])", r"\1", nombre).strip(" ,;:-")
+    nombre = SUFIJO_SIN_PUNTO_FINAL_RE.sub(r"\1.", nombre)
+    return nombre.upper() or None
+
+
+def _mitad_de_nombre(linea, excluir_plano):
+    """Si una linea puede ser la primera mitad de un nombre partido en dos."""
+    limpia = _sin_ruc(linea)
+    plano = normalize(limpia)
+    if not (3 <= len(limpia) <= 70):
+        return None
+    if any(plano.startswith(t) for t in TITULOS_DOCUMENTO):
+        return None
+    if re.search(r"\d", limpia) or ":" in limpia:
+        return None
+    if any(termino in plano for termino in excluir_plano):
+        return None
+    if len(re.findall(r"[A-Z]", plano)) < 3:
+        return None
+    return limpia
+
+
+def find_razon_social_emisor(text, excluir=()):
+    """Razon social del proveedor: la primera linea que lleva forma societaria.
+
+    Contempla las tres maneras en que las cabeceras la parten:
+    - nombre y RUC en la misma linea ("CENCOSUD RETAIL PERU S.A. R.U.C. ..."),
+      que tambien es como el OCR devuelve casi todas las cabeceras;
+    - nombre arriba, RUC en medio y el resto del nombre abajo;
+    - la forma societaria sola en su linea ("S.A.C"), bajo el nombre.
+    Las lineas de `excluir` -por ejemplo el nombre de la propia empresa- se
+    saltan para no confundir al emisor con el cliente.
     """
     lineas = split_lines(text)[:15]
     excluir_plano = [normalize(termino) for termino in excluir]
 
     for indice, linea in enumerate(lineas):
-        limpia = collapse_spaces(linea)
-        if not limpia or len(limpia) < 6 or len(limpia) > 90:
+        limpia = _sin_ruc(linea)
+        if not limpia or len(limpia) < 3:
             continue
 
         plano = normalize(limpia)
@@ -410,8 +455,27 @@ def find_razon_social_emisor(text, excluir=()):
         sufijo = SUFIJO_SOCIETARIO_RE.search(limpia)
         if not sufijo:
             continue
-        limpia = collapse_spaces(limpia[:sufijo.end()])
-        if not limpia:
+        nombre = collapse_spaces(limpia[:sufijo.end()]) or ""
+        antes_del_sufijo = limpia[:sufijo.start()]
+
+        # Lo que va antes del sufijo tiene que parecer un nombre: una frase
+        # con dos puntos es un aviso de pago o una direccion, no la cabecera.
+        if ":" in antes_del_sufijo or len(nombre) > 90:
+            continue
+
+        # La forma societaria sola en su linea: el nombre esta arriba,
+        # a veces con la linea del RUC en medio.
+        if not re.search(r"[A-Za-z]{2,}", antes_del_sufijo):
+            for salto in (1, 2):
+                if indice - salto < 0:
+                    break
+                previa = lineas[indice - salto]
+                if not _sin_ruc(previa):
+                    continue  # la linea del RUC, se salta
+                mitad = _mitad_de_nombre(previa, excluir_plano)
+                if mitad:
+                    return _pulir_razon_social(f"{mitad} {nombre}")
+                break
             continue
 
         # El RUC suele meterse entre las dos lineas del nombre, asi que se mira
@@ -439,10 +503,10 @@ def find_razon_social_emisor(text, excluir=()):
                 and not any(termino in plano_previa for termino in excluir_plano)
             )
             if es_continuacion:
-                return collapse_spaces(f"{previa} {limpia}")
+                return _pulir_razon_social(f"{previa} {nombre}")
             break
 
-        return limpia
+        return _pulir_razon_social(nombre)
 
     return None
 
@@ -536,7 +600,12 @@ NO_ES_NOMBRE = (
     "DIRECCION", "TELEFONO", "TELEFONOS", "TELF", "FAX", "PAGINA WEB",
     "CLIENTE", "AV.", "AV ", "CAL.", "CALLE", "JR.", "JIRON", "URB.",
     "NRO.", "CENTRAL TELEFONICA", "REPRESENTACION", "AUTORIZADO",
+    "OFICINA", "CODIGO", "DESCRIPCION", "CANTIDAD", "SON:", "SON :",
 )
+
+# Donde empieza el bloque del cliente. El nombre del emisor siempre va antes;
+# lo que viene despues (datos del cliente, tabla de detalle) no puede serlo.
+INICIO_BLOQUE_CLIENTE = ("SENOR", "SE" + REEMPLAZO + "OR", "CLIENTE", "ADQUIRIENTE")
 
 # Coletillas del titulo que a veces quedan pegadas al nombre cuando el PDF
 # parte "FACTURA ELECTRONICA" en dos columnas.
@@ -558,6 +627,8 @@ def _nombre_plausible(linea):
         return None
     if re.search(r"\d{3,}", plano):          # direcciones y telefonos
         return None
+    if ":" in limpia:                          # etiquetas y avisos de pago
+        return None
     if len(re.findall(r"[A-Z]", plano)) < 6:
         return None
     return limpia
@@ -576,9 +647,12 @@ def find_nombre_emisor(text, excluir=()):
 
     excluir_plano = [normalize(termino) for termino in excluir]
     for linea in split_lines(text)[:12]:
-        if any(termino in normalize(linea) for termino in excluir_plano):
+        plano = normalize(linea)
+        if plano.startswith(INICIO_BLOQUE_CLIENTE):
+            break
+        if any(termino in plano for termino in excluir_plano):
             continue
-        nombre = _nombre_plausible(linea)
+        nombre = _nombre_plausible(_sin_ruc(linea))
         if nombre:
             return nombre
 

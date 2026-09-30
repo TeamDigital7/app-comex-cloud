@@ -317,3 +317,20 @@ En ILP el resultado se puede contrastar contra el propio PDF, que imprime
 
 Restaura `app_comex_cloud.py` desde el commit `2a25d7d`. Los archivos nuevos
 pueden quedarse: sin el entrypoint nuevo, nadie los importa.
+
+---
+
+## 8. Razón social de los proveedores (Arriendos y Contabilidad)
+
+La razón social se resuelve en este orden:
+
+1. **`forus_proveedores.py`**: catálogo RUC → razón social de los proveedores
+   recurrentes. Es la fuente fiable para los que dibujan su nombre en el logo
+   (Cencosud, Tres Palmeras, Mall Service). Para añadir uno, basta una línea.
+2. El texto del PDF, buscando la forma societaria (S.A.C., S.A., S.R.L....),
+   aunque venga en la misma línea que el RUC o partida en dos líneas.
+3. La cabecera leída por OCR (solo si 1 y 2 fallan). Se marca "verificar".
+4. El nombre comercial del texto, marcado para revisar.
+
+Si el PDF no trae el RUC del emisor, se toma del nombre del archivo SUNAT
+(`20109072177_01_FA26-277696.pdf`).

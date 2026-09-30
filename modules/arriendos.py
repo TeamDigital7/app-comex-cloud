@@ -29,6 +29,7 @@ from forus_parsing import (
     find_money,
     find_percent,
     find_nombre_emisor,
+    find_razon_social_emisor,
     find_ruc,
     mes_de_fecha,
     normalize,
@@ -36,6 +37,7 @@ from forus_parsing import (
     split_lines,
 )
 from forus_conceptos import concepto_o_original
+from forus_proveedores import razon_social_por_ruc, ruc_de_nombre_archivo
 from forus_comprobante import (
     extraer_lineas_detalle,
     zona_detalle,
@@ -409,16 +411,91 @@ def extraer_cabecera(texto, pagina_inicial):
     return fila
 
 
+RUC_FORUS = "20514811271"
+
+
+def resolver_razon_social(cabecera, texto, datos_pdf, nombre_archivo):
+    """Razon social completa del emisor y, si hace falta, un aviso.
+
+    Se prueba de lo mas fiable a lo menos:
+    1. el catalogo de proveedores recurrentes, por RUC;
+    2. el texto del PDF, buscando la forma societaria (S.A.C., S.A. ...);
+    3. la cabecera leida por OCR, para los que dibujan el nombre en el logo;
+    4. el nombre comercial que haya en el texto, avisando para revisarlo.
+    """
+    ruc = cabecera.get("RUC Emisor")
+    if not ruc or ruc == RUC_FORUS:
+        ruc = ruc_de_nombre_archivo(nombre_archivo) or ruc
+        cabecera["RUC Emisor"] = ruc
+
+    registrada = razon_social_por_ruc(ruc)
+    if registrada:
+        return registrada, None
+
+    en_texto = find_razon_social_emisor(texto, excluir=("FORUS",))
+    if en_texto:
+        return en_texto, None
+
+    pagina = cabecera.get("Pagina Inicial") or 1
+    en_logo = find_razon_social_emisor(
+        forus_ocr.cabecera_por_ocr(datos_pdf, pagina), excluir=("FORUS",)
+    )
+    if en_logo:
+        return en_logo, "Razon social leida por OCR de la cabecera: verificar"
+
+    comercial = find_nombre_emisor(texto, excluir=("FORUS",))
+    if comercial:
+        return comercial.upper(), "Razon social sin forma societaria (puede ser el nombre comercial): verificar"
+    return None, "No se encontro la razon social: completar a mano"
+
+
+# El local que Cencosud pone en la glosa de cada concepto: "- LC M1104",
+# "- LC 5A", "- LC Local S2012".
+LOCAL_EN_GLOSA_RE = re.compile(r"\bLC\s*[-:.]?\s*(?:LOCAL\s+)?([A-Z]{0,4}-?\d[A-Z0-9/\-]*)\b")
+
+
+def local_de_glosa(glosa):
+    if not glosa:
+        return None
+    match = LOCAL_EN_GLOSA_RE.search(normalize(glosa))
+    return match.group(1) if match else None
+
+
 def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documento=None):
     """Convierte cada concepto en una fila del control."""
     base = cabecera.get("_base")
     posicion, cuadro = elegir_columna_valor(filas_detalle, base)
     moneda = cabecera.get("Moneda")
     igv_total = cabecera.get("IGV") or 0
-    suma_base = sum(
-        fila["numeros"][posicion] for fila in filas_detalle
-        if len(fila["numeros"]) >= abs(posicion)
-    )
+
+    # Hay proveedores (Cencosud) cuyo detalle ya viene con IGV: ninguna columna
+    # cuadra con la base, pero si con el importe total. En ese caso el valor
+    # sin IGV de cada concepto es su parte proporcional de la base. Solo se
+    # hace cuando todo es gravado; con partes inafectas el reparto no seria
+    # exacto y mejor avisar.
+    factor_sin_igv = None
+    total = cabecera.get("Importe Total")
+    solo_gravado = not (cabecera.get("Op. Inafectas") or cabecera.get("Op. Exoneradas"))
+    if not cuadro and base and total and total > base and solo_gravado:
+        posicion_total, cuadra_total = elegir_columna_valor(filas_detalle, total)
+        if cuadra_total:
+            posicion, cuadro = posicion_total, True
+            factor_sin_igv = base / total
+
+    valores = []
+    for fila in filas_detalle:
+        numeros = fila["numeros"]
+        valores.append(numeros[posicion] if len(numeros) >= abs(posicion) else numeros[-1])
+
+    importes_con_igv = None
+    if factor_sin_igv is not None:
+        importes_con_igv = list(valores)
+        valores = [round(valor * factor_sin_igv, 2) for valor in valores]
+        # El redondeo se ajusta en la ultima linea para que la suma sea la base.
+        if valores:
+            valores[-1] = round(valores[-1] + (base - sum(valores)), 2)
+
+    suma_base = sum(valores)
 
     # La columna Tienda lleva el local cuando la factura lo trae y, si no, el
     # numero de contrato: es lo que identifica el punto en cada proveedor.
@@ -429,9 +506,11 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
     )
 
     control = []
-    for fila in filas_detalle:
-        numeros = fila["numeros"]
-        valor = numeros[posicion] if len(numeros) >= abs(posicion) else numeros[-1]
+    for indice, fila in enumerate(filas_detalle):
+        valor = valores[indice]
+        # Si el concepto dice su propio local, ese manda sobre el del documento.
+        local_propio = local_de_glosa(fila.get("glosa"))
+        tienda_fila = local_propio or tienda
 
         mes, periodo_desde, aviso_mes = mes_del_concepto(
             fila, mes_documento or "", cabecera
@@ -445,7 +524,9 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
         concepto, reconocido = concepto_o_original(fila["concepto"])
         if not reconocido:
             notas.append("Concepto sin normalizar: revisar")
-        if not tienda:
+        if cabecera.get("_aviso_razon"):
+            notas.append(cabecera["_aviso_razon"])
+        if not tienda_fila:
             notas.append("Sin local ni contrato en el documento: completar a mano")
         if not cuadro and base is not None:
             notas.append("El detalle no cuadra con la base imponible")
@@ -454,12 +535,14 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
 
         # El IGV del documento se reparte entre conceptos segun su peso.
         con_igv = None
-        if valor is not None and suma_base:
+        if importes_con_igv is not None:
+            con_igv = importes_con_igv[indice]
+        elif valor is not None and suma_base:
             con_igv = round(valor + igv_total * (valor / suma_base), 2)
 
         control.append({
             "Fecha": fecha_es(cabecera.get("Fecha")),
-            "Tienda": tienda,
+            "Tienda": tienda_fila,
             "MES": mes,
             "Concepto": concepto,
             "SOLES": valor if moneda == "PEN" else None,
@@ -468,7 +551,7 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
             "RAZON SOCIAL": cabecera.get("RAZON SOCIAL"),
             "FECHA DE ENTREGA": None,  # no viene en el PDF, se completa a mano
             "Contrato": cabecera.get("Contrato"),
-            "Local": cabecera.get("Local / Tienda"),
+            "Local": local_propio or cabecera.get("Local / Tienda"),
             "Tipo Documento": cabecera.get("Tipo Documento"),
             "Periodo Desde": fila["desde"],
             "Periodo Hasta": fila["hasta"],
@@ -520,6 +603,9 @@ def process_pdf(uploaded_file):
         # detalle: repiten importes de otras facturas y ensuciarian el control.
         texto = "\n".join(pagina["texto"] for pagina in documento["paginas"])
         cabecera = extraer_cabecera(texto, documento["pagina_inicial"])
+        cabecera["RAZON SOCIAL"], cabecera["_aviso_razon"] = resolver_razon_social(
+            cabecera, texto, uploaded_file.getvalue(), uploaded_file.name
+        )
 
         # Los anexos no aportan detalle -repiten importes de otras facturas-,
         # pero si suelen traer el nombre del local mejor identificado.
@@ -549,6 +635,16 @@ def process_pdf(uploaded_file):
         factura["Suma Conceptos"] = round(suma_base, 2) if filas_detalle else None
         factura["Cuadra Base"] = cuadra(cabecera.get("_base"), suma_base, tolerancia=0.10)
         factura["Observaciones"] = faltantes(factura, CAMPOS_OBLIGATORIOS)
+        if cabecera.get("_aviso_razon"):
+            factura["Observaciones"] = "; ".join(
+                x for x in [factura["Observaciones"], cabecera["_aviso_razon"]] if x
+            )
+        # Si cada concepto trae su local, la factura los lista todos.
+        locales = list(dict.fromkeys(
+            local for local in (local_de_glosa(f.get("glosa")) for f in filas_detalle) if local
+        ))
+        if locales:
+            factura["Local / Tienda"] = " / ".join(locales)
         if not filas_detalle:
             factura["Observaciones"] = "; ".join(
                 filtro for filtro in [factura["Observaciones"], "No se leyo ningun concepto"] if filtro

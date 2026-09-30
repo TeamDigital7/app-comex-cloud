@@ -47,6 +47,7 @@ from forus_parsing import (
     parse_amount,
     split_lines,
 )
+from forus_proveedores import razon_social_por_ruc
 from forus_ui import (
     close_card,
     format_file_size,
@@ -252,7 +253,9 @@ def extraer_cabecera(text, pagina_inicial, paginas):
         "Correlativo": correlativo or None,
         "Numero": numero,
         "RUC Emisor": ruc_emisor,
-        "Razon Social Emisor": find_nombre_emisor(text, excluir=("FORUS",)),
+        "Razon Social Emisor": (
+            razon_social_por_ruc(ruc_emisor) or find_nombre_emisor(text, excluir=("FORUS",))
+        ),
         "RUC Cliente": ruc_cliente,
         "Razon Social Cliente": find_label_value(text, [
             "SENOR(ES)", "SENORES", "SENOR", "CLIENTE", "ADQUIRIENTE",

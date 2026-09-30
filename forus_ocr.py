@@ -163,8 +163,11 @@ def _agrupar_en_lineas(bloques):
     )
 
 
-def texto_por_ocr(datos_pdf, numeros_pagina):
+def texto_por_ocr(datos_pdf, numeros_pagina, fraccion_superior=None):
     """Texto de las paginas indicadas de un PDF, leidas por OCR.
+
+    Con `fraccion_superior` solo se lee esa parte de arriba de la pagina (0.3
+    es el tercio superior), que es mucho mas rapido cuando basta la cabecera.
 
     Devuelve {numero_de_pagina: texto}. Las paginas que fallen no aparecen.
     """
@@ -192,6 +195,9 @@ def texto_por_ocr(datos_pdf, numeros_pagina):
                 continue
             try:
                 imagen = documento[indice].render(scale=RESOLUCION / 72).to_pil()
+                if fraccion_superior:
+                    ancho, alto = imagen.size
+                    imagen = imagen.crop((0, 0, ancho, int(alto * fraccion_superior)))
                 bloques = _bloques(motor(np.array(imagen)))
             except Exception as error:  # una pagina ilegible no frena a las demas
                 _ULTIMO_ERROR["motivo"] = f"El OCR fallo en la pagina {numero}: {error}"
@@ -203,6 +209,16 @@ def texto_por_ocr(datos_pdf, numeros_pagina):
         documento.close()
 
     return resultados
+
+
+def cabecera_por_ocr(datos_pdf, numero_pagina):
+    """Texto de la cabecera de una pagina, leido por OCR.
+
+    Sirve para lo que el PDF dibuja en vez de escribir: hay proveedores que
+    ponen su razon social dentro del logo, y ese nombre no sale en el texto.
+    Devuelve "" si el OCR no esta disponible o no lee nada.
+    """
+    return texto_por_ocr(datos_pdf, [numero_pagina], fraccion_superior=0.35).get(numero_pagina, "")
 
 
 def completar_paginas_vacias(datos_pdf, paginas):

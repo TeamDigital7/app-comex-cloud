@@ -211,15 +211,26 @@ RUIDO_DETALLE = (
 # proposito: se comeria el final de "RENTA MINIMA LOCAL".
 UNIDADES = {
     "UN", "UND", "UNI", "NIU", "ZZ", "LOCALES", "SER", "KGM", "KG", "MTR",
-    "M2", "M3", "GLL", "PZA", "DIA", "DIAS", "MES", "MESES", "SET", "DOC",
+    "M2", "M3", "GLL", "PZA", "DIA", "DIAS", "MES", "MESES", "SET", "DOC", "ST",
 }
+
+# Codigo de servicio SAP que Cencosud pone delante del concepto: "ZPGJ Gasto
+# Comun fijo", "ZINT Intereses Punitorios". Va en mayusculas y el concepto no.
+CODIGO_SAP_RE = re.compile(r"Z[A-Z]{3}")
 
 CONECTORES_SUELTOS = {"DEL", "AL", "DE", "A", "-", "AL.", "Y"}
 
 # Una linea de concepto acaba en dos a cinco importes separados por espacios.
+# Cada importe tiene que llevar algun digito: un punto suelto al final de una
+# glosa ("VTAS: 253525.77 .") no es una columna.
 LINEA_DETALLE_RE = re.compile(
-    r"^(?P<cuerpo>.*?[A-Za-z].*?)\s+(?P<numeros>(?:-?[\d.,]+\s+){1,4}-?[\d.,]+)$"
+    r"^(?P<cuerpo>.*?[A-Za-z].*?)\s+"
+    r"(?P<numeros>(?:-?[\d.,]*\d[\d.,]*\s+){1,4}-?[\d.,]*\d[\d.,]*)$"
 )
+
+# Glosas informativas que llevan cifras pero no son conceptos: la base de la
+# renta variable ("%RV: 8.50 - VTAS: 253525.77") repite las ventas del mes.
+GLOSA_INFORMATIVA_RE = re.compile(r"%\s*[A-Z]{2,6}\s*:|\bVTAS\s*:|\bVENTAS\s*:")
 
 
 def zona_detalle(texto):
@@ -273,6 +284,10 @@ def limpiar_concepto(cuerpo, periodo_texto):
             codigo = token
             tokens.pop(0)
             continue
+        if codigo is None and len(tokens) > 1 and CODIGO_SAP_RE.fullmatch(token):
+            codigo = token
+            tokens.pop(0)
+            continue
         break
 
     # Cola: unidad y conectores que quedaron sueltos al quitar el periodo.
@@ -288,9 +303,28 @@ def limpiar_concepto(cuerpo, periodo_texto):
     return collapse_spaces(" ".join(tokens)), codigo, cantidad, unidad
 
 
+def _anotar_continuacion(fila, linea):
+    """Guarda la linea que completa un concepto y rescata su periodo.
+
+    Hay proveedores que ponen el periodo y el local en una segunda linea bajo
+    el concepto: "ZPGJ Gasto Comun fijo ... 4,344.03" y debajo
+    "*01.09.2026-30.09.2026-Gastos Fijos - LC Local S2012".
+    """
+    fila["glosa"] = collapse_spaces(f"{fila.get('glosa') or ''} {linea}")
+    if not fila.get("desde"):
+        desde, hasta, _ = extraer_periodo(linea)
+        if desde:
+            fila["desde"], fila["hasta"] = desde, hasta
+
+
 def extraer_lineas_detalle(texto):
-    """Conceptos de la factura, cada uno con todos sus importes de la fila."""
+    """Conceptos de la factura, cada uno con todos sus importes de la fila.
+
+    Cada fila lleva ademas en "glosa" las lineas sin importes que la siguen,
+    que es donde algunos proveedores ponen el periodo y el local.
+    """
     filas = []
+    ultima = None  # la fila a la que pertenecen las lineas de continuacion
 
     for linea in zona_detalle(texto):
         limpia = collapse_spaces(linea)
@@ -299,12 +333,18 @@ def extraer_lineas_detalle(texto):
 
         plano = normalize(limpia)
         if any(ruido in plano for ruido in RUIDO_DETALLE):
+            ultima = None
             continue
         if NUMERO_FACTURA_RE.search(limpia):
             continue
 
         match = LINEA_DETALLE_RE.match(limpia)
-        if not match:
+        if not match or GLOSA_INFORMATIVA_RE.search(plano):
+            # Solo las dos lineas que siguen al concepto: mas abajo ya suele
+            # ser el pie de la factura.
+            if ultima is not None and ultima["_continuaciones"] < 2:
+                _anotar_continuacion(ultima, limpia)
+                ultima["_continuaciones"] += 1
             continue
 
         numeros = [parse_amount(token) for token in match.group("numeros").split()]
@@ -327,6 +367,9 @@ def extraer_lineas_detalle(texto):
             "desde": desde,
             "hasta": hasta,
             "numeros": numeros,
+            "glosa": None,
+            "_continuaciones": 0,
         })
+        ultima = filas[-1]
 
     return filas
