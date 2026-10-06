@@ -8,3 +8,4 @@ pypdfium2
 rapidocr
 onnxruntime
 opencv-python-headless
+pillow-heif

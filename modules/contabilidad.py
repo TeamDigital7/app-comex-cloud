@@ -476,7 +476,8 @@ def leer_paginas(uploaded_file):
 
     Las paginas escaneadas no traen texto: esas se leen por OCR.
     """
-    datos = uploaded_file.getvalue()
+    # Una foto suelta (JPG, PNG, HEIC) se convierte antes en un PDF.
+    datos = forus_ocr.pdf_del_archivo(uploaded_file.name, uploaded_file.getvalue())
     paginas = []
     with pdfplumber.open(io.BytesIO(datos)) as pdf:
         for numero, page in enumerate(pdf.pages, start=1):
@@ -944,8 +945,8 @@ def _cargar_comprobantes(clave, titulo):
     """Bloques 1 y 2 de la pantalla: cargar archivos y listarlos."""
     st.markdown(f'<div class="work-card upload-wrap acct"><h3>{titulo}</h3></div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
-        "Subir PDFs de comprobantes",
-        type=["pdf"],
+        "Subir PDFs o fotos de comprobantes",
+        type=forus_ocr.TIPOS_ARCHIVO,
         accept_multiple_files=True,
         label_visibility="collapsed",
         key=f"{clave}_uploader",
@@ -966,7 +967,7 @@ def _cargar_comprobantes(clave, titulo):
                 (
                     archivo.name,
                     f"{format_file_size(getattr(archivo, 'size', None))} - Comprobante",
-                    "PDF",
+                    archivo.name.rsplit(".", 1)[-1].upper() if "." in archivo.name else "PDF",
                     "Listo",
                 )
                 for archivo in uploaded_files

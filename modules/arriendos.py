@@ -485,7 +485,8 @@ def construir_filas_control(cabecera, filas_detalle, nombre_archivo, mes_documen
 
 def leer_paginas(uploaded_file):
     """Texto de cada pagina; las escaneadas se leen por OCR."""
-    datos = uploaded_file.getvalue()
+    # Una foto suelta (JPG, PNG, HEIC) se convierte antes en un PDF.
+    datos = forus_ocr.pdf_del_archivo(uploaded_file.name, uploaded_file.getvalue())
     paginas = []
     with pdfplumber.open(io.BytesIO(datos)) as pdf:
         for numero, page in enumerate(pdf.pages, start=1):
@@ -730,8 +731,8 @@ def render():
 
     st.markdown(f'<div class="work-card upload-wrap hr"><h3>1. Cargar facturas</h3></div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
-        "Subir PDFs de facturas de alquiler",
-        type=["pdf"],
+        "Subir PDFs o fotos de facturas de alquiler",
+        type=forus_ocr.TIPOS_ARCHIVO,
         accept_multiple_files=True,
         label_visibility="collapsed",
         key="alquileres_uploader",
@@ -752,7 +753,7 @@ def render():
                 (
                     archivo.name,
                     f"{format_file_size(getattr(archivo, 'size', None))} - Factura de alquiler",
-                    "PDF",
+                    archivo.name.rsplit(".", 1)[-1].upper() if "." in archivo.name else "PDF",
                     "Listo",
                 )
                 for archivo in uploaded_files

@@ -557,3 +557,64 @@ def completar_paginas_vacias(datos_pdf, paginas):
             pagina["ocr"] = True
 
     return sorted(leidas)
+
+
+# ---------------------------------------------------------------------------
+# Fotos sueltas (JPG, PNG, HEIC del iPhone...). Se convierten en un PDF de una
+# pagina por foto y desde ahi siguen el mismo camino que un PDF escaneado.
+# ---------------------------------------------------------------------------
+EXTENSIONES_IMAGEN = ["jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff", "bmp"]
+
+# Lo que aceptan las pantallas de carga.
+TIPOS_ARCHIVO = ["pdf"] + EXTENSIONES_IMAGEN
+
+# La foto se lleva al tamano de una hoja A4 (11.69 pulgadas de alto), para que
+# al rasterizarla a RESOLUCION salga con el detalle que el OCR necesita sea
+# cual sea la camara.
+ALTO_HOJA_PULGADAS = 11.69
+
+
+def es_pdf(datos):
+    return b"%PDF" in (datos or b"")[:1024]
+
+
+def pdf_del_archivo(nombre, datos):
+    """Los bytes del PDF a leer. Si el archivo es una foto, la convierte.
+
+    Respeta la orientacion que guarda el celular en la foto (EXIF): sin eso,
+    una foto tomada en vertical llega acostada.
+    """
+    if es_pdf(datos):
+        return datos
+
+    from PIL import Image, ImageOps
+
+    extension = (nombre or "").rsplit(".", 1)[-1].lower()
+    if extension in ("heic", "heif"):
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        except ImportError as error:
+            raise ValueError(
+                "Foto HEIC del iPhone y falta pillow-heif en requirements.txt"
+            ) from error
+
+    try:
+        imagen = Image.open(io.BytesIO(datos))
+    except Exception as error:
+        raise ValueError("No es un PDF ni una imagen que se pueda abrir") from error
+
+    paginas = []
+    for indice in range(getattr(imagen, "n_frames", 1)):  # un TIFF puede traer varias
+        imagen.seek(indice)
+        pagina = ImageOps.exif_transpose(imagen.copy()).convert("RGB")
+        paginas.append(pagina)
+
+    alto = max(max(pagina.size) for pagina in paginas)
+    salida = io.BytesIO()
+    paginas[0].save(
+        salida, "PDF", save_all=True, append_images=paginas[1:],
+        resolution=max(alto / ALTO_HOJA_PULGADAS, 1.0),
+    )
+    return salida.getvalue()
