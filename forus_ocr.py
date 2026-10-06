@@ -54,8 +54,13 @@ def estado_ocr():
     try:
         _clase_motor()
     except ImportError as error:
+        if "libGL" in str(error) or "libglib" in str(error) or "libgthread" in str(error):
+            return False, (
+                f"OpenCV no encuentra una libreria del sistema ({error}). Falta el "
+                "archivo packages.txt con libgl1 en la raiz del repositorio"
+            )
         return False, (
-            f"Falta el motor de OCR ({error.name}). Anade rapidocr a requirements.txt"
+            f"Falta el motor de OCR ({error.name or error}). Anade rapidocr a requirements.txt"
         )
     except Exception as error:
         return False, (
@@ -79,8 +84,15 @@ def _clase_motor():
     """
     try:
         from rapidocr import RapidOCR
-    except ImportError:
-        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as error_nuevo:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            # El error que importa es el de la version nueva, que es la que esta
+            # en requirements.txt. Antes se informaba el de la antigua y el
+            # aviso decia "falta rapidocr_onnxruntime" cuando lo que faltaba de
+            # verdad era libGL, que OpenCV necesita para cargarse.
+            raise error_nuevo from None
     return RapidOCR
 
 
@@ -118,19 +130,58 @@ def _bloques(resultado):
     ]
 
 
+def _confianza(valor):
+    try:  # la confianza llega unas veces como numero y otras como texto
+        return float(valor)
+    except (TypeError, ValueError):
+        return None
+
+
+def _inclinacion(bloques):
+    """Angulo (radianes) en que esta torcida la hoja, a partir de las cajas.
+
+    Cada caja de una palabra larga es casi un rectangulo alineado con su
+    renglon; la mediana de sus angulos es la inclinacion de la foto.
+    """
+    import math
+
+    angulos = []
+    for caja, _, _ in bloques:
+        (x0, y0), (x1, y1) = caja[0], caja[1]
+        ancho = math.hypot(x1 - x0, y1 - y0)
+        alto = math.hypot(caja[3][0] - x0, caja[3][1] - y0)
+        if ancho > 3 * alto and ancho > 0:
+            angulos.append(math.atan2(y1 - y0, x1 - x0))
+    if len(angulos) < 5:
+        return 0.0
+    angulos.sort()
+    return angulos[len(angulos) // 2]
+
+
 def _agrupar_en_lineas(bloques):
-    """Reconstruye las lineas del documento a partir de las cajas del OCR."""
+    """Reconstruye las lineas del documento a partir de las cajas del OCR.
+
+    En una foto la hoja casi nunca esta derecha: con unos grados de giro, el
+    final de un renglon queda a la altura del siguiente y antes se juntaba toda
+    la cabecera en una sola linea, con la fecha lejos de su rotulo. Por eso las
+    coordenadas se enderezan primero y cada trozo se compara con la altura media
+    del renglon, no con el ultimo trozo anadido.
+    """
+    import math
+
+    angulo = _inclinacion(bloques)
+    coseno, seno = math.cos(-angulo), math.sin(-angulo)
+
     elementos = []
     for caja, texto, confianza in bloques:
         if not texto:
             continue
-        try:  # la confianza llega unas veces como numero y otras como texto
-            if float(confianza) < CONFIANZA_MINIMA:
-                continue
-        except (TypeError, ValueError):
-            pass
-        ys = [punto[1] for punto in caja]
-        xs = [punto[0] for punto in caja]
+        valor = _confianza(confianza)
+        if valor is not None and valor < CONFIANZA_MINIMA:
+            continue
+        puntos = [(x * coseno - y * seno, x * seno + y * coseno) for x, y in caja]
+        ys = [punto[1] for punto in puntos]
+        xs = [punto[0] for punto in puntos]
         elementos.append({
             "centro": sum(ys) / len(ys),
             "alto": max(ys) - min(ys),
@@ -141,26 +192,249 @@ def _agrupar_en_lineas(bloques):
     if not elementos:
         return ""
 
+    altos = sorted(e["alto"] for e in elementos)
+    alto_tipico = altos[len(altos) // 2] or 1
+
     elementos.sort(key=lambda e: (e["centro"], e["x"]))
 
     lineas = []
     actual = [elementos[0]]
+    centro_linea = elementos[0]["centro"]
     for elemento in elementos[1:]:
-        referencia = actual[-1]
-        # Dos trozos son de la misma linea si sus centros estan mas cerca que
-        # media altura de texto.
-        tolerancia = max(referencia["alto"], elemento["alto"]) * 0.6
-        if abs(elemento["centro"] - referencia["centro"]) <= tolerancia:
+        # Dos trozos son del mismo renglon si el centro del nuevo cae a menos
+        # de media altura de texto del centro medio del renglon.
+        tolerancia = max(alto_tipico, min(elemento["alto"], 2 * alto_tipico)) * 0.55
+        if abs(elemento["centro"] - centro_linea) <= tolerancia:
             actual.append(elemento)
+            centro_linea = sum(e["centro"] for e in actual) / len(actual)
         else:
             lineas.append(actual)
             actual = [elemento]
+            centro_linea = elemento["centro"]
     lineas.append(actual)
 
     return "\n".join(
         " ".join(trozo["texto"] for trozo in sorted(linea, key=lambda e: e["x"]))
         for linea in lineas
     )
+
+
+# ---------------------------------------------------------------------------
+# Fotos de facturas: hoja sobre la mesa, girada, con perspectiva.
+# ---------------------------------------------------------------------------
+
+# Palabras que tiene cualquier comprobante. Sirven para saber si una lectura
+# salio bien: leida al reves o de lado, el OCR no las reconoce.
+PALABRAS_COMPROBANTE = (
+    "RUC", "FACTURA", "BOLETA", "TOTAL", "IGV", "FECHA", "SON", "SOLES",
+    "IMPORTE", "EMISION", "ELECTRONICA", "CLIENTE", "SENOR", "MONEDA",
+)
+
+
+def _puntaje(bloques):
+    """Que tan bien se leyo una imagen: caracteres leidos con confianza y
+    palabras de comprobante reconocidas."""
+    import unicodedata
+
+    caracteres = 0.0
+    texto = []
+    for _, contenido, confianza in bloques:
+        valor = _confianza(confianza)
+        if not contenido or (valor is not None and valor < CONFIANZA_MINIMA):
+            continue
+        caracteres += len(str(contenido)) * (valor if valor is not None else 1.0)
+        texto.append(str(contenido))
+    plano = unicodedata.normalize("NFKD", " ".join(texto).upper())
+    plano = "".join(c for c in plano if not unicodedata.combining(c))
+    palabras = sum(1 for palabra in PALABRAS_COMPROBANTE if palabra in plano)
+    return caracteres + 60 * palabras, palabras
+
+
+def _leer(motor, imagen):
+    """OCR de una imagen sin el clasificador de giro de renglones.
+
+    El clasificador endereza cada renglon por separado y deja la hoja leida de
+    abajo arriba; sin el, una hoja al reves sale con poca confianza, y eso es
+    justo lo que permite detectar que hay que girarla.
+    """
+    try:
+        return _bloques(motor(imagen, use_cls=False))
+    except TypeError:  # version antigua, sin ese parametro
+        return _bloques(motor(imagen))
+
+
+def _recortar_hoja(imagen):
+    """Endereza la perspectiva de una foto recortando la hoja.
+
+    Busca el contorno de cuatro lados mas grande y claro de la imagen -la hoja
+    sobre la mesa- y lo lleva a un rectangulo. Si no hay una hoja clara (un
+    escaneo de borde a borde) devuelve la imagen tal cual.
+    """
+    import cv2
+    import numpy as np
+
+    alto, ancho = imagen.shape[:2]
+    escala = 1000.0 / max(alto, ancho)
+    chica = cv2.resize(imagen, None, fx=escala, fy=escala, interpolation=cv2.INTER_AREA)
+    gris = cv2.GaussianBlur(cv2.cvtColor(chica, cv2.COLOR_RGB2GRAY), (5, 5), 0)
+
+    area_total = chica.shape[0] * chica.shape[1]
+    candidatos = []
+    _, binaria = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bordes = cv2.dilate(cv2.Canny(gris, 50, 150), np.ones((3, 3), np.uint8))
+    for mascara in (binaria, bordes):
+        contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contorno in sorted(contornos, key=cv2.contourArea, reverse=True)[:3]:
+            perimetro = cv2.arcLength(contorno, True)
+            aproximado = cv2.approxPolyDP(contorno, 0.02 * perimetro, True)
+            area = cv2.contourArea(aproximado)
+            if len(aproximado) == 4 and 0.25 * area_total <= area <= 0.97 * area_total:
+                candidatos.append((area, aproximado.reshape(4, 2).astype("float32")))
+        if candidatos:
+            break
+
+    if not candidatos:
+        return imagen
+
+    # Solo es una hoja sobre la mesa si por fuera del contorno es mas oscuro
+    # que por dentro. Asi un recuadro o una tabla de un escaneo normal, que
+    # tienen papel blanco alrededor, no se recortan por error.
+    contorno_chico = max(candidatos, key=lambda c: c[0])[1]
+    mascara = np.zeros(gris.shape, np.uint8)
+    cv2.fillConvexPoly(mascara, contorno_chico.astype(np.int32), 255)
+    dentro = cv2.mean(gris, mask=mascara)[0]
+    fuera = cv2.mean(gris, mask=cv2.bitwise_not(mascara))[0]
+    if dentro - fuera < 30:
+        return imagen
+
+    puntos = contorno_chico / escala
+    # Orden: arriba-izquierda, arriba-derecha, abajo-derecha, abajo-izquierda.
+    suma = puntos.sum(axis=1)
+    resta = np.diff(puntos, axis=1).ravel()
+    ordenados = np.array([
+        puntos[np.argmin(suma)], puntos[np.argmin(resta)],
+        puntos[np.argmax(suma)], puntos[np.argmax(resta)],
+    ], dtype="float32")
+    if len({tuple(p) for p in ordenados.tolist()}) < 4:
+        return imagen
+
+    def distancia(a, b):
+        return float(np.hypot(*(a - b)))
+
+    nuevo_ancho = int(max(distancia(ordenados[0], ordenados[1]), distancia(ordenados[3], ordenados[2])))
+    nuevo_alto = int(max(distancia(ordenados[0], ordenados[3]), distancia(ordenados[1], ordenados[2])))
+    if nuevo_ancho < 300 or nuevo_alto < 300:
+        return imagen
+
+    destino = np.array(
+        [[0, 0], [nuevo_ancho - 1, 0], [nuevo_ancho - 1, nuevo_alto - 1], [0, nuevo_alto - 1]],
+        dtype="float32",
+    )
+    matriz = cv2.getPerspectiveTransform(ordenados, destino)
+    return cv2.warpPerspective(imagen, matriz, (nuevo_ancho, nuevo_alto))
+
+
+# Rotulos de la cabecera y del pie de un comprobante. En una hoja derecha la
+# cabecera queda arriba del pie; si sale al reves, la hoja esta de cabeza.
+PALABRAS_CABECERA = ("RUC", "SENOR", "EMISION", "CLIENTE")
+PALABRAS_PIE = ("SON", "IMPORTE TOTAL", "REPRESENTACION", "TOTAL A PAGAR", "OP. GRAVADA")
+
+
+def _plano(texto):
+    import unicodedata
+
+    plano = unicodedata.normalize("NFKD", str(texto or "").upper())
+    return "".join(c for c in plano if not unicodedata.combining(c))
+
+
+def _geometria(bloques):
+    """(fraccion de renglones horizontales, orden) de una lectura.
+
+    El OCR lee el texto aunque la hoja este de lado o de cabeza -gira cada
+    renglon por su cuenta-, asi que lo leido no sirve para saber el giro. Lo
+    que si lo dice es la forma: de lado, las cajas son verticales; de cabeza,
+    el pie aparece encima de la cabecera. `orden` vale 1 si la cabecera esta
+    arriba, -1 si esta abajo y 0 si no se puede saber.
+    """
+    horizontales = verticales = 0
+    cabecera, pie = [], []
+    for caja, texto, confianza in bloques:
+        if not texto or len(str(texto).strip()) < 4:
+            continue
+        xs = [punto[0] for punto in caja]
+        ys = [punto[1] for punto in caja]
+        if max(xs) - min(xs) >= max(ys) - min(ys):
+            horizontales += 1
+        else:
+            verticales += 1
+        plano = _plano(texto)
+        centro = sum(ys) / len(ys)
+        if any(palabra in plano for palabra in PALABRAS_CABECERA):
+            cabecera.append(centro)
+        if any(palabra in plano for palabra in PALABRAS_PIE):
+            pie.append(centro)
+
+    total = horizontales + verticales
+    fraccion = horizontales / total if total else 0.0
+
+    orden = 0
+    if cabecera and pie:
+        cabecera.sort()
+        pie.sort()
+        orden = 1 if cabecera[len(cabecera) // 2] < pie[len(pie) // 2] else -1
+    return fraccion, orden
+
+
+def _girar(imagen, giro):
+    import numpy as np
+
+    return np.ascontiguousarray(np.rot90(imagen, giro)) if giro else imagen
+
+
+def _leer_imagen(motor, imagen):
+    """Bloques de la mejor lectura posible de la imagen de una pagina.
+
+    1. Si es una foto de la hoja sobre la mesa, se recorta la hoja y se le
+       quita la perspectiva.
+    2. Se lee. Si los renglones salen horizontales y la cabecera arriba, ya
+       esta: es el caso de casi todos los escaneos y cuesta una sola lectura.
+    3. Si no, se gira lo que haga falta (90, 180 o 270 grados) y se vuelve a
+       leer. Si ninguna lectura queda clara, gana la de mejor puntaje.
+    """
+    base = _recortar_hoja(imagen)
+
+    lecturas = {}
+
+    def leer(giro):
+        if giro not in lecturas:
+            bloques = _leer(motor, _girar(base, giro))
+            puntaje, palabras = _puntaje(bloques)
+            fraccion, orden = _geometria(bloques)
+            lecturas[giro] = {
+                "bloques": bloques,
+                "puntaje": puntaje,
+                "horizontal": fraccion >= 0.6,
+                # Derecha de verdad: renglones horizontales, se reconocen las
+                # palabras de un comprobante y la cabecera no queda abajo. De
+                # cabeza el OCR devuelve basura sin esas palabras.
+                "clara": fraccion >= 0.6 and palabras >= 6 and orden > 0,
+            }
+        return lecturas[giro]
+
+    if leer(0)["clara"]:
+        return lecturas[0]["bloques"]
+
+    # Horizontal pero no clara: esta de cabeza. Si no, esta de lado.
+    for giro in ((2,) if lecturas[0]["horizontal"] else (1, 3)):
+        if leer(giro)["clara"]:
+            return lecturas[giro]["bloques"]
+
+    # Nada quedo claro: gana el mejor puntaje entre las lecturas con renglones
+    # horizontales, probando antes los giros que falten.
+    for giro in (0, 1, 2, 3):
+        leer(giro)
+    horizontales = [v for v in lecturas.values() if v["horizontal"]] or list(lecturas.values())
+    return max(horizontales, key=lambda v: v["puntaje"])["bloques"]
 
 
 def texto_por_ocr(datos_pdf, numeros_pagina):
@@ -191,8 +465,10 @@ def texto_por_ocr(datos_pdf, numeros_pagina):
             if indice < 0 or indice >= len(documento):
                 continue
             try:
-                imagen = documento[indice].render(scale=RESOLUCION / 72).to_pil()
-                bloques = _bloques(motor(np.array(imagen)))
+                imagen = np.array(
+                    documento[indice].render(scale=RESOLUCION / 72).to_pil().convert("RGB")
+                )
+                bloques = _leer_imagen(motor, imagen)
             except Exception as error:  # una pagina ilegible no frena a las demas
                 _ULTIMO_ERROR["motivo"] = f"El OCR fallo en la pagina {numero}: {error}"
                 continue
@@ -205,20 +481,140 @@ def texto_por_ocr(datos_pdf, numeros_pagina):
     return resultados
 
 
-def completar_paginas_vacias(datos_pdf, paginas):
-    """Rellena por OCR las paginas que no traian texto.
+# Una pagina que es casi toda imagen y trae poco texto es una foto o un escaneo
+# aunque tenga algo de texto: las apps de escaneo le ponen su marca ("Escaneado
+# con CamScanner") y antes eso bastaba para que no se pasara por OCR.
+COBERTURA_FOTO = 0.5
+TEXTO_MINIMO = 150
 
-    Devuelve la lista de paginas leidas asi, para poder avisar de que esas
-    cifras vienen de un escaneo y conviene revisarlas.
+
+def _cobertura_imagenes(datos_pdf):
+    """{numero_de_pagina: fraccion de la pagina cubierta por imagenes}."""
+    try:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+    except ImportError:
+        return {}
+
+    cobertura = {}
+    try:
+        documento = pdfium.PdfDocument(io.BytesIO(datos_pdf))
+    except Exception:
+        return {}
+    try:
+        for indice in range(len(documento)):
+            pagina = documento[indice]
+            ancho, alto = pagina.get_size()
+            area = (ancho * alto) or 1
+            cubierta = 0.0
+            for objeto in pagina.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE], max_depth=3):
+                # get_bounds en pypdfium2 5.x; get_pos en la 4.x.
+                limites = getattr(objeto, "get_bounds", None) or getattr(objeto, "get_pos")
+                izquierda, abajo, derecha, arriba = limites()
+                cubierta += max(0.0, min(derecha, ancho) - max(izquierda, 0)) * max(
+                    0.0, min(arriba, alto) - max(abajo, 0)
+                )
+            cobertura[indice + 1] = min(cubierta / area, 1.0)
+    except Exception:  # si no se puede medir, la pagina se trata como antes
+        pass
+    finally:
+        documento.close()
+    return cobertura
+
+
+def _necesita_ocr(pagina, cobertura):
+    texto = (pagina.get("texto") or "").strip()
+    if not texto:
+        return True
+    util = len("".join(texto.split()))
+    return util < TEXTO_MINIMO and cobertura.get(pagina["numero"], 0) >= COBERTURA_FOTO
+
+
+def completar_paginas_vacias(datos_pdf, paginas):
+    """Rellena por OCR las paginas escaneadas o fotografiadas.
+
+    Son las que no traen texto y las que son casi solo una imagen con un texto
+    minimo encima. Devuelve la lista de paginas leidas asi, para poder avisar
+    de que esas cifras vienen de un escaneo y conviene revisarlas.
     """
-    vacias = [p["numero"] for p in paginas if not (p["texto"] or "").strip()]
-    if not vacias:
+    con_texto_minimo = [
+        p for p in paginas
+        if (p.get("texto") or "").strip() and len("".join(p["texto"].split())) < TEXTO_MINIMO
+    ]
+    cobertura = _cobertura_imagenes(datos_pdf) if con_texto_minimo else {}
+
+    a_leer = [p["numero"] for p in paginas if _necesita_ocr(p, cobertura)]
+    if not a_leer:
         return []
 
-    leidas = texto_por_ocr(datos_pdf, vacias)
+    leidas = texto_por_ocr(datos_pdf, a_leer)
     for pagina in paginas:
         if pagina["numero"] in leidas:
-            pagina["texto"] = leidas[pagina["numero"]]
+            original = (pagina.get("texto") or "").strip()
+            # El texto minimo que traia la pagina (la marca de la app) se
+            # conserva al final, donde no estorba a la lectura de la factura.
+            pagina["texto"] = leidas[pagina["numero"]] + (f"\n{original}" if original else "")
             pagina["ocr"] = True
 
     return sorted(leidas)
+
+
+# ---------------------------------------------------------------------------
+# Fotos sueltas (JPG, PNG, HEIC del iPhone...). Se convierten en un PDF de una
+# pagina por foto y desde ahi siguen el mismo camino que un PDF escaneado.
+# ---------------------------------------------------------------------------
+EXTENSIONES_IMAGEN = ["jpg", "jpeg", "png", "heic", "heif", "webp", "tif", "tiff", "bmp"]
+
+# Lo que aceptan las pantallas de carga.
+TIPOS_ARCHIVO = ["pdf"] + EXTENSIONES_IMAGEN
+
+# La foto se lleva al tamano de una hoja A4 (11.69 pulgadas de alto), para que
+# al rasterizarla a RESOLUCION salga con el detalle que el OCR necesita sea
+# cual sea la camara.
+ALTO_HOJA_PULGADAS = 11.69
+
+
+def es_pdf(datos):
+    return b"%PDF" in (datos or b"")[:1024]
+
+
+def pdf_del_archivo(nombre, datos):
+    """Los bytes del PDF a leer. Si el archivo es una foto, la convierte.
+
+    Respeta la orientacion que guarda el celular en la foto (EXIF): sin eso,
+    una foto tomada en vertical llega acostada.
+    """
+    if es_pdf(datos):
+        return datos
+
+    from PIL import Image, ImageOps
+
+    extension = (nombre or "").rsplit(".", 1)[-1].lower()
+    if extension in ("heic", "heif"):
+        try:
+            import pillow_heif
+
+            pillow_heif.register_heif_opener()
+        except ImportError as error:
+            raise ValueError(
+                "Foto HEIC del iPhone y falta pillow-heif en requirements.txt"
+            ) from error
+
+    try:
+        imagen = Image.open(io.BytesIO(datos))
+    except Exception as error:
+        raise ValueError("No es un PDF ni una imagen que se pueda abrir") from error
+
+    paginas = []
+    for indice in range(getattr(imagen, "n_frames", 1)):  # un TIFF puede traer varias
+        imagen.seek(indice)
+        pagina = ImageOps.exif_transpose(imagen.copy()).convert("RGB")
+        paginas.append(pagina)
+
+    alto = max(max(pagina.size) for pagina in paginas)
+    salida = io.BytesIO()
+    paginas[0].save(
+        salida, "PDF", save_all=True, append_images=paginas[1:],
+        resolution=max(alto / ALTO_HOJA_PULGADAS, 1.0),
+    )
+    return salida.getvalue()
