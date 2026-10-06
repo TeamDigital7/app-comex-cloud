@@ -54,8 +54,13 @@ def estado_ocr():
     try:
         _clase_motor()
     except ImportError as error:
+        if "libGL" in str(error) or "libglib" in str(error) or "libgthread" in str(error):
+            return False, (
+                f"OpenCV no encuentra una libreria del sistema ({error}). Falta el "
+                "archivo packages.txt con libgl1 en la raiz del repositorio"
+            )
         return False, (
-            f"Falta el motor de OCR ({error.name}). Anade rapidocr a requirements.txt"
+            f"Falta el motor de OCR ({error.name or error}). Anade rapidocr a requirements.txt"
         )
     except Exception as error:
         return False, (
@@ -79,8 +84,15 @@ def _clase_motor():
     """
     try:
         from rapidocr import RapidOCR
-    except ImportError:
-        from rapidocr_onnxruntime import RapidOCR
+    except ImportError as error_nuevo:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            # El error que importa es el de la version nueva, que es la que esta
+            # en requirements.txt. Antes se informaba el de la antigua y el
+            # aviso decia "falta rapidocr_onnxruntime" cuando lo que faltaba de
+            # verdad era libGL, que OpenCV necesita para cargarse.
+            raise error_nuevo from None
     return RapidOCR
 
 

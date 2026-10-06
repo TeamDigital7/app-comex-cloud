@@ -137,6 +137,11 @@ PORCENTAJE_DETRACCION_SIN_SIMBOLO_RE = re.compile(
     r"PORCENTAJE\s+(?:DE\s+)?DETRACCI[OÓ]N\s*[:.]?\s*(\d{1,2}(?:[.,]\d{1,2})?)",
     re.I,
 )
+# "% Detracción: 12.00" (Bizlinks) y "TASA 12%" en el bloque de comentarios.
+PORCENTAJE_DETRACCION_OTROS_RE = [
+    re.compile(r"%\s*DETRACCI[OÓ]N\s*[:.]?\s*(\d{1,2}(?:[.,]\d{1,2})?)", re.I),
+    re.compile(r"^\s*TASA\s*(?:DE\s+DETRACCI[OÓ]N)?\s*[:.]?\s*(\d{1,2}(?:[.,]\d{1,2})?)\s*%", re.I | re.M),
+]
 PORCENTAJE_SUELTO_RE = re.compile(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%")
 # El codigo identifica el bien o servicio del Anexo que fija la tasa. Cada
 # proveedor lo rotula a su manera: "Codigo Detraccion: 019" o, en la
@@ -146,6 +151,27 @@ CODIGO_DETRACCION_RE = re.compile(
     r"|C[OÓ]DIGO\s+(?:DE\s+)?BIEN\s+O\s+SERVICIO)\s*[:.]?\s*(\d{3})\b",
     re.I,
 )
+# "CODIGO 037" en una linea sola, dentro del bloque de la detraccion.
+CODIGO_SUELTO_RE = re.compile(r"^\s*C[OÓ]DIGO\s*[:.]?\s*(\d{3})\s*$", re.I | re.M)
+
+# Tasas que existen en las tablas de SUNAT. Sirven para reconocer la tasa
+# cuando el comprobante imprime el monto pero no el porcentaje.
+TASAS_CONOCIDAS = (1.5, 4.0, 10.0, 12.0, 15.0)
+
+# Diferencia admitida entre el monto de detraccion impreso y el que sale de
+# aplicar la tasa al total. El deposito se redondea a soles enteros, asi que
+# por debajo de un sol es solo redondeo.
+TOLERANCIA_MONTO_DETRACCION = 1.0
+
+
+def tasa_desde_monto(monto, total):
+    """Tasa que explica el monto impreso, si coincide con una tasa real."""
+    if not monto or not total:
+        return None
+    for conocida in TASAS_CONOCIDAS:
+        if abs(abs(total) * conocida / 100 - abs(monto)) <= TOLERANCIA_MONTO_DETRACCION:
+            return conocida
+    return None
 
 
 def get_parametros():
@@ -233,6 +259,8 @@ def detectar_detraccion(texto):
     # Sobre el texto normalizado: si no, "Código" con tilde no casa nunca.
     codigo = None
     match_codigo = CODIGO_DETRACCION_RE.search(normalize(texto or ""))
+    if not match_codigo:
+        match_codigo = CODIGO_SUELTO_RE.search(normalize(texto or ""))
     if match_codigo:
         codigo = match_codigo.group(1)
 
@@ -245,6 +273,16 @@ def detectar_detraccion(texto):
         match = PORCENTAJE_DETRACCION_SIN_SIMBOLO_RE.search(texto or "")
         if match:
             porcentaje = parse_amount(match.group(1))
+
+    if porcentaje is None:
+        for patron in PORCENTAJE_DETRACCION_OTROS_RE:
+            match = patron.search(texto or "")
+            if match:
+                porcentaje = parse_amount(match.group(1))
+                break
+
+    if porcentaje is not None and not (1 <= porcentaje <= 15):
+        porcentaje = None  # se leyo otro numero
 
     if porcentaje is None:
         # Algunos lo imprimen suelto, en la misma linea de la cuenta del Banco
@@ -333,12 +371,20 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
         origen = "comprobante" if porcentaje is not None else None
         concepto = tasas.get(codigo, (None, None))[0] if codigo else None
 
-        # Nivel 2: el comprobante trae el codigo pero no la tasa.
+        # Nivel 2: trae el monto pero no la tasa; la tasa es la que explica
+        # ese monto.
+        if porcentaje is None and monto:
+            deducida = tasa_desde_monto(monto, total)
+            if deducida is not None:
+                porcentaje = deducida
+                origen = "monto impreso"
+
+        # Nivel 3: el comprobante trae el codigo pero no la tasa.
         if porcentaje is None and codigo and codigo in tasas:
             porcentaje = tasas[codigo][1]
             origen = "tabla"
 
-        # Nivel 3: no trae ninguno de los dos; se deduce del concepto.
+        # Nivel 4: no trae ninguno de los dos; se deduce del concepto.
         if porcentaje is None:
             codigo_probable = buscar_codigo_por_concepto(glosa)
             if codigo_probable and codigo_probable in tasas:
@@ -353,12 +399,37 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
 
         por_defecto = origen == "configuracion"
 
-        if monto is None and porcentaje is not None:
-            bruto = total * porcentaje / 100
+        calculado = None
+        if porcentaje is not None:
+            bruto = abs(total) * porcentaje / 100
             # El deposito de la detraccion se hace en soles enteros. En una
             # factura en dolares el importe se conserva con sus decimales: el
             # redondeo corresponde al monto en soles del dia del deposito.
-            monto = float(round(bruto)) if moneda in (None, "PEN") else round(bruto, 2)
+            calculado = float(round(bruto)) if moneda in (None, "PEN") else round(bruto, 2)
+
+        # Control del monto impreso: el proveedor puede equivocarse (se han
+        # visto facturas con "12%" y un monto que no es el 12% del total). Lo
+        # que hay que depositar es la tasa sobre el total, asi que se usa el
+        # calculado y la fila queda marcada para que se vea.
+        alerta = None
+        if monto is not None and calculado is not None and origen in ("comprobante", "tabla"):
+            if abs(abs(monto) - calculado) > TOLERANCIA_MONTO_DETRACCION:
+                if origen == "comprobante":
+                    alerta = (
+                        f"REVISAR detraccion: el comprobante imprime {monto:,.2f} pero el "
+                        f"{porcentaje:g}% de {total:,.2f} es {calculado:,.2f}; se uso el calculado"
+                    )
+                    monto = calculado
+                else:
+                    # La tasa de la tabla esta por validar: no se impone al
+                    # monto del comprobante, solo se avisa.
+                    alerta = (
+                        f"REVISAR detraccion: el comprobante imprime {monto:,.2f} y la tabla "
+                        f"({porcentaje:g}% del codigo {codigo}) daria {calculado:,.2f}"
+                    )
+
+        if monto is None:
+            monto = calculado
 
         if monto is None:
             return {
@@ -376,6 +447,9 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
                       f"deducido del concepto ({concepto}). VERIFICAR")
         elif origen == "configuracion":
             motivo = f"Detraccion sin porcentaje impreso: se aplico el {porcentaje}% configurado"
+        elif origen == "monto impreso":
+            motivo = (f"El comprobante indica detraccion de {monto:,.2f} sin imprimir el "
+                      f"porcentaje: corresponde al {porcentaje:g}% del total")
         elif porcentaje is not None:
             motivo = f"El comprobante indica detraccion del {porcentaje}%"
         else:
@@ -391,6 +465,7 @@ def evaluar(total, moneda, tipo_cambio, texto, monto_detraccion=None, parametros
             "Monto Detraccion/Retencion": monto,
             "Neto a Pagar": round(total - monto, 2),
             "Importe en Soles": en_soles,
+            "Alerta Tributaria": alerta,
         }
 
     # 2. Sin detraccion, el umbral se mide en soles.

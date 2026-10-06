@@ -43,6 +43,8 @@ from forus_parsing import (
     find_percent,
     find_nombre_emisor,
     fix_mojibake,
+    importe_en_letras,
+    importes_del_texto,
     normalize,
     parse_amount,
     split_lines,
@@ -129,6 +131,9 @@ PAGOS_COLUMNS = [
     "DETRACCION/RETENCION",
     "ANTICIPOS",
     "MONTO A PAGAR",
+    # Al final, para no mover las columnas que se pegan en el control: "OK" o
+    # lo que hay que mirar en esa fila antes de pagar.
+    "VALIDACION",
 ]
 
 # Las mismas filas con todo lo que se leyo, para revisar de donde sale cada cosa.
@@ -144,6 +149,7 @@ PAGOS_AMPLIADO_COLUMNS = PAGOS_COLUMNS + [
     "Concepto Detraccion",
     "Origen Tasa",
     "Origen Texto",
+    "Importe en Letras",
     "Op. Gravadas",
     "IGV",
     "Orden de Compra",
@@ -244,6 +250,29 @@ def extraer_cabecera(text, pagina_inicial, paginas):
             igv = igv if igv is not None else igv_deducido
             total = total if total is not None else total_deducido
 
+    # El importe en letras es el control del total: si no coincide con lo leido
+    # en la tabla de totales (OCR desordenado, etiqueta "TOTAL" que acierta en
+    # otra fila), manda el de letras siempre que la misma cifra aparezca
+    # tambien escrita en numeros en el comprobante. Si no, se avisa.
+    alertas = []
+    en_letras = importe_en_letras(text)
+    if en_letras is not None and (total is None or abs(total - en_letras) > 0.01):
+        if en_letras in importes_del_texto(text):
+            if total is not None:
+                alertas.append(
+                    f"Importe total corregido con el importe en letras: se habia leido "
+                    f"{total:,.2f} y el comprobante dice {en_letras:,.2f}"
+                )
+            total = en_letras
+        elif total is not None:
+            alertas.append(
+                f"REVISAR importe: se leyo {total:,.2f} pero en letras dice {en_letras:,.2f}"
+            )
+
+    tipo_cambio = find_money(text, ["TIPO DE CAMBIO", "T.C.", "TIPO CAMBIO"])
+    if tipo_cambio is not None and not (0.1 <= tipo_cambio <= 20):
+        tipo_cambio = None  # "TIPO DE CAMBIO: GUIA N: 0T-..." no es un tipo de cambio
+
     fila = {
         "Pagina Inicial": pagina_inicial,
         "Paginas": paginas,
@@ -260,12 +289,12 @@ def extraer_cabecera(text, pagina_inicial, paginas):
         ]),
         "Fecha Emision": find_date(text, [
             "FECHA DE EMISION", "FECHA EMISION", "F. EMISION", "FECHA",
-        ]),
+        ], linea_siguiente=True),
         "Fecha Vencimiento": find_date(text, [
             "FECHA DE VENCIMIENTO", "FECHA VENCIMIENTO", "F. VENCIMIENTO",
         ]),
         "Moneda": moneda,
-        "Tipo de Cambio": find_money(text, ["TIPO DE CAMBIO", "T.C.", "TIPO CAMBIO"]),
+        "Tipo de Cambio": tipo_cambio,
         "Op. Gravadas": gravadas,
         "Op. Exoneradas": find_money(text, [
             "OP. EXONERADAS", "OP EXONERADAS", "OPERACIONES EXONERADAS", "OP. EXONERADA",
@@ -309,6 +338,8 @@ def extraer_cabecera(text, pagina_inicial, paginas):
         for extra in ("Op. Exoneradas", "Op. Inafectas", "ISC", "Otros Cargos"):
             esperado += fila.get(extra) or 0
     fila["Cuadra Total"] = cuadra(esperado, total, tolerancia=0.10)
+    fila["Importe en Letras"] = en_letras
+    fila["Alertas"] = alertas
 
     return fila
 
@@ -509,6 +540,28 @@ def construir_fila_pago(cabecera):
     }
 
 
+def validar_fila_pago(cabecera, leido_por_ocr=False):
+    """'OK' o la lista de lo que hay que revisar en la fila antes de pagarla."""
+    avisos = list(cabecera.get("Alertas") or [])
+    if cabecera.get("Alerta Tributaria"):
+        avisos.append(cabecera["Alerta Tributaria"])
+
+    sin_leer = faltantes(cabecera, CAMPOS_OBLIGATORIOS)
+    if sin_leer:
+        avisos.append(f"Sin leer: {sin_leer}")
+    if cabecera.get("Afecto a") == tributario.REVISAR:
+        avisos.append(cabecera.get("Motivo") or "Detraccion/retencion sin decidir")
+    if cabecera.get("Afecto a") == tributario.DETRACCION and cabecera.get("% Aplicado") is None:
+        avisos.append("Detraccion sin porcentaje")
+
+    en_letras = cabecera.get("Importe en Letras")
+    total = cabecera.get("Importe Total")
+    if en_letras is None and total is not None and leido_por_ocr:
+        avisos.append("Leido por OCR y sin importe en letras con que confirmarlo")
+
+    return "; ".join(avisos) if avisos else "OK"
+
+
 def process_pdf(uploaded_file, parametros=None):
     """Devuelve (documentos, items, auditoria) para un PDF."""
     parametros = parametros or tributario.get_parametros()
@@ -598,6 +651,7 @@ def process_pdf(uploaded_file, parametros=None):
         leido_por_ocr = any(pagina.get("ocr") for pagina in documento["paginas"])
         if leido_por_ocr:
             cabecera["Origen Texto"] = "OCR"
+        cabecera["VALIDACION"] = validar_fila_pago(cabecera, leido_por_ocr)
         cabecera["Observaciones"] = "; ".join(
             parte for parte in [
                 faltantes(cabecera, CAMPOS_OBLIGATORIOS),
@@ -679,6 +733,7 @@ def build_summary_pagos(documentos, archivos):
         {"Metric": "Monto total retenido", "Value": suma("Monto Detraccion/Retencion", tributario.RETENCION)},
         {"Metric": "Neto a pagar", "Value": suma("Neto a Pagar")},
         {"Metric": "Comprobantes con campos sin leer", "Value": sum(1 for d in documentos if d.get("Observaciones"))},
+        {"Metric": "Filas a revisar (VALIDACION distinta de OK)", "Value": sum(1 for d in documentos if d.get("VALIDACION") not in (None, "OK"))},
         {"Metric": "Archivos sin ningun comprobante", "Value": archivos - len({d.get("PDF File") for d in documentos})},
     ]
 
@@ -1010,6 +1065,17 @@ def render_pagos():
         ])
 
         avisar_no_leidos(uploaded_files, documentos)
+
+        a_validar = [d for d in documentos if d.get("VALIDACION") not in (None, "OK")]
+        if a_validar:
+            render_banner(
+                f"{len(a_validar)} fila(s) con algo que revisar antes de pagar. El detalle "
+                "esta en la columna VALIDACION.",
+                tipo="warn",
+            )
+            with st.expander(f"Ver las {len(a_validar)} filas a revisar"):
+                for documento in a_validar:
+                    st.write(f"- **{documento.get('DOCUMENTO') or documento.get('PDF File')}**: {documento['VALIDACION']}")
 
         if por_revisar:
             render_banner(

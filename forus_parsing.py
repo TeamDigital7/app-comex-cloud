@@ -250,46 +250,152 @@ MESES = {
 }
 
 
+MESES_ABREVIADOS = {
+    "ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6, "JUL": 7,
+    "AGO": 8, "SET": 9, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
+}
+
+# Cada formato devuelve (dia, mes, anio). Se prueban todos y gana el que
+# aparece primero en el texto: con "07-09-2026 Fecha vencimiento: 2026-09-17"
+# la fecha que vale es la primera, no la que tiene el formato preferido.
+FORMATOS_FECHA = [
+    (re.compile(r"\b(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\b"),
+     lambda g: (g[2], g[1], g[0])),
+    (re.compile(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4}|\d{2})\b"),
+     lambda g: (g[0], g[1], g[2])),
+    (re.compile(r"\b(\d{1,2})\s+DE\s+([A-Z]+)\s+DE\s+(\d{4})\b"),
+     lambda g: (g[0], MESES.get(g[1]), g[2])),
+    # "07-sep-2026", "07/SET/2026", "07 SEP. 2026".
+    (re.compile(r"\b(\d{1,2})[\s/\-.]+(" + "|".join(MESES_ABREVIADOS) + r")[A-Z]*\.?[\s/\-.]+(\d{4})\b"),
+     lambda g: (g[0], MESES_ABREVIADOS.get(g[1]), g[2])),
+]
+
+
 def parse_date(value):
     """Normaliza a AAAA-MM-DD las fechas mas comunes en documentos peruanos."""
     if not value:
         return None
 
-    texto = collapse_spaces(str(value))
+    texto = normalize(collapse_spaces(str(value)) or "")
     if not texto:
         return None
 
-    match = re.search(r"\b(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})\b", texto)
-    if match:
-        anio, mes, dia = match.groups()
-    else:
-        match = re.search(r"\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})\b", texto)
-        if match:
-            dia, mes, anio = match.groups()
+    candidatos = []
+    for patron, partes in FORMATOS_FECHA:
+        for match in patron.finditer(texto):
+            dia, mes, anio = partes(match.groups())
+            try:
+                dia, mes, anio = int(dia), int(mes), int(anio)
+            except (TypeError, ValueError):
+                continue
+            if anio < 100:
+                anio += 2000
+            if 1 <= mes <= 12 and 1 <= dia <= 31 and 1990 <= anio <= 2100:
+                candidatos.append((match.start(), f"{anio:04d}-{mes:02d}-{dia:02d}"))
+                break
+
+    if not candidatos:
+        return None
+    return min(candidatos)[1]
+
+
+def find_date(text, labels, linea_siguiente=False):
+    """Primera fecha valida que acompana a alguna de las etiquetas.
+
+    Con `linea_siguiente`, si la etiqueta no lleva la fecha en su misma linea
+    -cabeceras en forma de tabla, con todos los rotulos en una fila y los
+    valores en la siguiente- se toma la primera fecha de la linea de abajo.
+    Solo sirve para la etiqueta que va primero en esa fila (la de emision).
+    """
+    if not text:
+        return None
+
+    lineas = text.split("\n")
+    plano = normalize(text)
+    for label in labels:
+        for match in re.finditer(_patron_etiqueta(label) + r"\s*[:.\-]?\s*", plano):
+            resto = text[match.end():match.end() + 40].split("\n", 1)[0]
+            fecha = parse_date(resto)
+            if fecha:
+                return fecha
+            if not linea_siguiente or re.search(r"\d", resto):
+                continue
+            numero_linea = text.count("\n", 0, match.end())
+            if numero_linea + 1 < len(lineas):
+                fecha = parse_date(lineas[numero_linea + 1][:40])
+                if fecha:
+                    return fecha
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Importe en letras ("SON: UN MIL CUATROCIENTOS SETENTA Y CINCO Y 00/100 SOLES").
+# Toda factura peruana lo trae, y es el control mas fiable del importe total:
+# no depende de como el PDF arme la tabla de totales ni de que el OCR ponga
+# cada cifra en su sitio.
+# ---------------------------------------------------------------------------
+_UNIDADES = {
+    "CERO": 0, "UN": 1, "UNO": 1, "UNA": 1, "DOS": 2, "TRES": 3, "CUATRO": 4,
+    "CINCO": 5, "SEIS": 6, "SIETE": 7, "OCHO": 8, "NUEVE": 9, "DIEZ": 10,
+    "ONCE": 11, "DOCE": 12, "TRECE": 13, "CATORCE": 14, "QUINCE": 15,
+    "DIECISEIS": 16, "DIECISIETE": 17, "DIECIOCHO": 18, "DIECINUEVE": 19,
+    "VEINTE": 20, "VEINTIUN": 21, "VEINTIUNO": 21, "VEINTIDOS": 22,
+    "VEINTITRES": 23, "VEINTICUATRO": 24, "VEINTICINCO": 25, "VEINTISEIS": 26,
+    "VEINTISIETE": 27, "VEINTIOCHO": 28, "VEINTINUEVE": 29, "TREINTA": 30,
+    "CUARENTA": 40, "CINCUENTA": 50, "SESENTA": 60, "SETENTA": 70,
+    "OCHENTA": 80, "NOVENTA": 90, "CIEN": 100, "CIENTO": 100,
+    "DOSCIENTOS": 200, "TRESCIENTOS": 300, "CUATROCIENTOS": 400,
+    "QUINIENTOS": 500, "SEISCIENTOS": 600, "SETECIENTOS": 700,
+    "SETESCIENTOS": 700, "OCHOCIENTOS": 800, "NOVECIENTOS": 900,
+    "NOVESCIENTOS": 900,
+}
+
+IMPORTE_LETRAS_RE = re.compile(
+    r"\bSON\s*[:.]?\s*([A-Z\s]+?)\s+(?:Y|CON)\s+(\d{1,2})\s*/\s*100"
+)
+
+
+def _entero_en_letras(palabras):
+    total = 0
+    actual = 0
+    for palabra in palabras:
+        if palabra == "Y":
+            continue
+        if palabra in _UNIDADES:
+            actual += _UNIDADES[palabra]
+        elif palabra == "MIL":
+            total += (actual or 1) * 1000
+            actual = 0
+        elif palabra in ("MILLON", "MILLONES"):
+            total = (total + (actual or 1)) * 1_000_000
+            actual = 0
         else:
-            match = re.search(r"\b(\d{1,2})\s+DE\s+([A-Z]+)\s+DE\s+(\d{4})\b", normalize(texto))
-            if not match:
-                return None
-            dia, nombre_mes, anio = match.groups()
-            mes = MESES.get(nombre_mes)
-            if not mes:
-                return None
+            return None  # palabra que no es un numero: mejor no adivinar
+    return total + actual
 
-    try:
-        dia, mes, anio = int(dia), int(mes), int(anio)
-    except (TypeError, ValueError):
+
+def importe_en_letras(text):
+    """El importe escrito en letras, como numero. None si no se puede leer."""
+    match = IMPORTE_LETRAS_RE.search(normalize(text or ""))
+    if not match:
         return None
-
-    if anio < 100:
-        anio += 2000
-    if not (1 <= mes <= 12 and 1 <= dia <= 31):
+    palabras = match.group(1).split()
+    if not palabras:
         return None
+    entero = _entero_en_letras(palabras)
+    if entero is None:
+        return None
+    return round(entero + int(match.group(2)) / 100, 2)
 
-    return f"{anio:04d}-{mes:02d}-{dia:02d}"
 
-
-def find_date(text, labels):
-    return parse_date(find_label_value(text, labels, max_chars=40))
+def importes_del_texto(text):
+    """Todos los importes con decimales que aparecen escritos en el texto."""
+    valores = set()
+    for crudo in re.findall(r"\d[\d.,]*[.,]\d{2}\b", text or ""):
+        valor = parse_amount(crudo)
+        if valor is not None:
+            valores.add(round(valor, 2))
+    return valores
 
 
 def find_ruc(text, labels=None):
@@ -392,59 +498,119 @@ def find_razon_social_emisor(text, excluir=()):
     empresa- se saltan para no confundir al emisor con el cliente.
     """
     lineas = split_lines(text)[:15]
+    candidatos = []
+    for indice in range(len(lineas)):
+        nombre = _razon_social_en_linea(lineas, indice, excluir)
+        if nombre:
+            candidatos.append(nombre)
+
+    if not candidatos:
+        return None
+
+    # Muchos proveedores imprimen arriba el nombre comercial con forma
+    # societaria ("AUTOMOTRIZ J.P EIRL") y debajo la razon social completa
+    # ("CONTRATISTA GENERALES AUTOMOTRIZ J.P. E.I.R.L."). Si una contiene a la
+    # otra, vale la completa.
+    elegido = candidatos[0]
+    clave = _clave_nombre(elegido)
+    for otro in candidatos[1:]:
+        clave_otro = _clave_nombre(otro)
+        if len(clave_otro) > len(clave) and clave_otro.endswith(clave):
+            elegido, clave = otro, clave_otro
+    return elegido
+
+
+def _clave_nombre(nombre):
+    return re.sub(r"[^A-Z0-9]", "", normalize(nombre or ""))
+
+
+# Lo que precede a la razon social en la misma linea y no es parte de ella:
+# sellos de recepcion ("39655/28806") y restos del logo.
+PREFIJO_RUIDO_RE = re.compile(r"^(?:[\d/\-.:,]+\s+)+")
+
+
+def _limpiar_prefijo(nombre):
+    nombre = PREFIJO_RUIDO_RE.sub("", nombre or "").strip()
+    # El OCR suele leer el logo pegado al nombre: "IBDO BDO OUTSOURCING".
+    palabras = nombre.split()
+    if len(palabras) >= 3 and len(palabras[0]) == len(palabras[1]) + 1 and palabras[0].endswith(palabras[1]):
+        nombre = " ".join(palabras[1:])
+    return nombre
+
+
+# Rotulos de la linea del cliente: esa tambien lleva RUC y forma societaria.
+ROTULOS_CLIENTE = (
+    "CLIENTE", "ADQUIRIENTE", "SENOR", "SE" + REEMPLAZO + "OR", "RAZON SOCIAL",
+    "DENOMINACION", "NOMBRE",
+)
+
+
+def _razon_social_en_linea(lineas, indice, excluir=()):
+    """Razon social con forma societaria en la linea `indice`, o None.
+
+    Si la linea anterior es parte del nombre (pasa cuando el RUC lo parte en
+    dos), se une.
+    """
     excluir_plano = [normalize(termino) for termino in excluir]
+    linea = lineas[indice]
 
-    for indice, linea in enumerate(lineas):
-        limpia = collapse_spaces(linea)
-        if not limpia or len(limpia) < 6 or len(limpia) > 90:
-            continue
+    # "TAILOY S.A. R.U.C. Nro 20100049181": el nombre va antes del RUC. Antes
+    # esta linea se descartaba entera por llevar el RUC y se acababa tomando
+    # como proveedor el nombre del vendedor.
+    corte = re.search(r"(?i)\bR\.?\s*U\.?\s*C\b", linea)
+    if corte and corte.start() >= 6:
+        linea = linea[:corte.start()]
 
-        plano = normalize(limpia)
-        if any(termino in plano for termino in excluir_plano):
-            continue
-        if any(plano.startswith(titulo) for titulo in TITULOS_DOCUMENTO):
-            continue
-        if re.search(r"\b(?:10|15|16|17|20)\d{9}\b", plano):
-            continue
+    limpia = collapse_spaces(linea)
+    if not limpia or len(limpia) < 6 or len(limpia) > 90:
+        return None
 
-        sufijo = SUFIJO_SOCIETARIO_RE.search(limpia)
-        if not sufijo:
-            continue
-        limpia = collapse_spaces(limpia[:sufijo.end()])
-        if not limpia:
-            continue
+    plano = normalize(limpia)
+    if any(termino in plano for termino in excluir_plano):
+        return None
+    if any(plano.startswith(titulo) for titulo in TITULOS_DOCUMENTO):
+        return None
+    if any(rotulo in plano for rotulo in ROTULOS_CLIENTE):
+        return None
+    if re.search(r"\b(?:10|15|16|17|20)\d{9}\b", plano):
+        return None
 
-        # El RUC suele meterse entre las dos lineas del nombre, asi que se mira
-        # hacia arriba saltando la linea del propio RUC.
-        for salto in (1, 2):
-            if indice - salto < 0:
-                break
+    sufijo = SUFIJO_SOCIETARIO_RE.search(limpia)
+    if not sufijo:
+        return None
+    limpia = _limpiar_prefijo(collapse_spaces(limpia[:sufijo.end()]))
+    if not limpia or len(re.findall(r"[A-Za-z]", limpia)) < 4:
+        return None
 
-            previa = collapse_spaces(lineas[indice - salto]) or ""
-            plano_previa = normalize(previa)
-
-            if plano_previa.startswith(("R.U.C", "RUC")) or re.search(
-                r"\b(?:10|15|16|17|20)\d{9}\b", plano_previa
-            ):
-                continue
-
-            # Solo se une cuando lo que separa las dos mitades del nombre es la
-            # linea del RUC. Si la linea de arriba es adyacente, no forma parte
-            # del nombre: suele ser el centro comercial ("INOUTLET FAUCETT").
-            es_continuacion = (
-                salto == 2
-                and 6 <= len(previa) <= 60
-                and not any(plano_previa.startswith(t) for t in TITULOS_DOCUMENTO)
-                and not re.search(r"\d", previa)
-                and not any(termino in plano_previa for termino in excluir_plano)
-            )
-            if es_continuacion:
-                return collapse_spaces(f"{previa} {limpia}")
+    # El RUC suele meterse entre las dos lineas del nombre, asi que se mira
+    # hacia arriba saltando la linea del propio RUC.
+    for salto in (1, 2):
+        if indice - salto < 0:
             break
 
-        return limpia
+        previa = collapse_spaces(lineas[indice - salto]) or ""
+        plano_previa = normalize(previa)
 
-    return None
+        if plano_previa.startswith(("R.U.C", "RUC")) or re.search(
+            r"\b(?:10|15|16|17|20)\d{9}\b", plano_previa
+        ):
+            continue
+
+        # Solo se une cuando lo que separa las dos mitades del nombre es la
+        # linea del RUC. Si la linea de arriba es adyacente, no forma parte
+        # del nombre: suele ser el centro comercial ("INOUTLET FAUCETT").
+        es_continuacion = (
+            salto == 2
+            and 6 <= len(previa) <= 60
+            and not any(plano_previa.startswith(t) for t in TITULOS_DOCUMENTO)
+            and not re.search(r"\d", previa)
+            and not any(termino in plano_previa for termino in excluir_plano)
+        )
+        if es_continuacion:
+            return collapse_spaces(f"{previa} {limpia}")
+        break
+
+    return limpia
 
 
 NOMBRES_MES = [
