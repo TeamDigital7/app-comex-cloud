@@ -554,10 +554,21 @@ def validar_fila_pago(cabecera, leido_por_ocr=False):
     if cabecera.get("Afecto a") == tributario.DETRACCION and cabecera.get("% Aplicado") is None:
         avisos.append("Detraccion sin porcentaje")
 
-    en_letras = cabecera.get("Importe en Letras")
-    total = cabecera.get("Importe Total")
-    if en_letras is None and total is not None and leido_por_ocr:
-        avisos.append("Leido por OCR y sin importe en letras con que confirmarlo")
+    # En una foto un digito mal leido cambia el importe sin que nada falle. El
+    # importe en letras lo confirma; si el OCR no lo pudo leer, el segundo
+    # control es que Op. Gravadas + IGV cuadre con el total.
+    if leido_por_ocr and cabecera.get("Importe en Letras") is None and cabecera.get("Importe Total") is not None:
+        cuadre = cabecera.get("Cuadra Total")
+        if cuadre == "No":
+            avisos.append(
+                "REVISAR importe: leido por OCR y Op. Gravadas + IGV no cuadra con el "
+                f"total leido ({cabecera['Importe Total']:,.2f}); comparar con el PDF"
+            )
+        elif cuadre is None:
+            avisos.append(
+                "REVISAR importe: leido por OCR sin importe en letras ni subtotales "
+                "con que confirmarlo"
+            )
 
     return "; ".join(avisos) if avisos else "OK"
 

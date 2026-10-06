@@ -138,6 +138,13 @@ def parse_amount(value):
         if decimales == 3 and texto.count(decimal) == 1 and miles not in texto:
             # "1.234" o "1,234": tres cifras detras es separador de miles.
             texto = texto.replace(decimal, "")
+        elif texto.count(decimal) > 1 and decimales == 3 and miles not in texto:
+            # "1.000.000": todos son separadores de miles.
+            texto = texto.replace(decimal, "")
+        elif texto.count(decimal) > 1 and decimales == 2 and miles not in texto:
+            # "1.004.48": el OCR usa el mismo signo para miles y decimales.
+            entero, _, centimos = texto.rpartition(decimal)
+            texto = entero.replace(decimal, "") + "." + centimos
         else:
             texto = texto.replace(miles, "").replace(decimal, ".")
 
@@ -719,6 +726,11 @@ def _nombre_plausible(linea):
     if not (6 <= len(limpia) <= 90):
         return None
     if any(plano.startswith(t) for t in NO_ES_NOMBRE):
+        return None
+    # El titulo del comprobante en medio de la linea: "CENTRO DE SALUD
+    # OCUPACIONAL FACTURA ELECTRONICA" es el lema del logo junto al titulo, no
+    # el nombre del emisor.
+    if re.search(r"\b(?:FACTURA|BOLETA|NOTA DE (?:CREDITO|DEBITO))\b", plano):
         return None
     if re.search(r"\b(?:10|15|16|17|20)\d{9}\b", plano):
         return None
